@@ -2,7 +2,8 @@ from abc import ABC
 
 from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 from torch.nn.utils.rnn import pad_sequence
-from transformers import AdamW, Adafactor, get_linear_schedule_with_warmup, get_constant_schedule
+from torch.optim import AdamW
+from transformers import get_constant_schedule
 from accelerate import Accelerator
 from torch.utils.data import Dataset
 from tqdm import tqdm
@@ -103,11 +104,11 @@ class Tree:
 def train():
     accelerator = Accelerator()
     os.environ['TOKENIZERS_PARALLELISM'] = 'false'
-    epochs = 100
+    epochs = 50
     batch_size = 64
     save_path = 'out/dsi'
-    model = AutoModelForSeq2SeqLM.from_pretrained('google-t5/t5-base')
-    tokenizer = AutoTokenizer.from_pretrained('google-t5/t5-base')
+    model = AutoModelForSeq2SeqLM.from_pretrained('google-t5/t5-large')
+    tokenizer = AutoTokenizer.from_pretrained('google-t5/t5-large')
 
     num_of_new_tokens = 109739
 
@@ -117,7 +118,7 @@ def train():
     data = json.load(open('dataset/nq320k/train.json'))
     # data.extend(json.load(open('dataset/nq320k/qg.json')))
 
-    optimizer = AdamW(model.parameters(), 5e-4)
+    optimizer = AdamW(model.parameters(), 2e-4)
 
     dataset = NQDataset(data=data, tokenizer=tokenizer, max_len=32)
     accelerator.print(f'data size={len(dataset)}')
@@ -150,7 +151,7 @@ def train():
             loss_report.append(loss.item())
             tk0.set_postfix(loss=sum(loss_report) / len(loss_report))
         accelerator.wait_for_everyone()
-        if accelerator.is_local_main_process:
+        if accelerator.is_local_main_process and (epoch % 10 == 0 or epoch == epochs - 1):
             accelerator.save(accelerator.unwrap_model(model).state_dict(), f'{save_path}/{epoch}.pt')
 
 
