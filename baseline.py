@@ -104,26 +104,22 @@ def train():
     accelerator = Accelerator()
     os.environ['TOKENIZERS_PARALLELISM'] = 'false'
     epochs = 100
-    batch_size = 128
+    batch_size = 64
     save_path = 'out/dsi'
-    model = AutoModelForSeq2SeqLM.from_pretrained('models/t5-base')
-    tokenizer = AutoTokenizer.from_pretrained('models/t5-base')
+    model = AutoModelForSeq2SeqLM.from_pretrained('google-t5/t5-base')
+    tokenizer = AutoTokenizer.from_pretrained('google-t5/t5-base')
 
-    num_of_new_tokens = 10  # 109739
+    num_of_new_tokens = 109739
 
-    tokenizer.add_tokens([f'${i}$' for i in range(num_of_new_tokens)])  # 109739
+    tokenizer.add_tokens([f'${i}$' for i in range(num_of_new_tokens)])
     model.resize_token_embeddings(len(tokenizer))
 
     data = json.load(open('dataset/nq320k/train.json'))
-    data.extend(json.load(open('dataset/nq320k/qg.json')))
-
-    corpus = json.load(open('dataset/nq320k_id/id.random2.json'))
-    corpus = [''.join([f'${i}$' for i in z]) for z in corpus]
-    corpus = [f'${z}$' for z in corpus]
+    # data.extend(json.load(open('dataset/nq320k/qg.json')))
 
     optimizer = AdamW(model.parameters(), 5e-4)
 
-    dataset = NewNQDataset(data=data, corpus=corpus, tokenizer=tokenizer, max_len=32)
+    dataset = NQDataset(data=data, tokenizer=tokenizer, max_len=32)
     accelerator.print(f'data size={len(dataset)}')
     data_loader = torch.utils.data.DataLoader(dataset, collate_fn=dataset.collate_fn, batch_size=batch_size,
                                               shuffle=True, num_workers=8)

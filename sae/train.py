@@ -57,9 +57,6 @@ class Config:
     wandb_run_name: str | None = None
 
 
-# ---------------------------------------------------------------------------
-# Activation collection
-# ---------------------------------------------------------------------------
 
 @torch.no_grad()
 def collect_activations_batch(dataset_iter, model, tokenizer, cfg, device, target_tokens=4096):
@@ -90,7 +87,7 @@ def collect_activations_batch(dataset_iter, model, tokenizer, cfg, device, targe
 
         _, cache = model.run_with_cache(
             enc_tokens.input_ids,
-            
+            attention_mask=enc_tokens.attention_mask,
             decoder_input=dec_tokens.input_ids,
             names_filter=lambda name: name == cfg.hook_name,
         )
