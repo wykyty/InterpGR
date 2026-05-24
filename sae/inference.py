@@ -256,6 +256,34 @@ def make_patching_hook(
 
 
 @torch.no_grad()
+def make_hf_replacement_hook(
+    sae: SAE,
+    scaling_factor: float,
+) -> Callable:
+    """Create a forward hook for HuggingFace T5 decoder MLP layer.
+
+    Replaces MLP output with SAE-reconstructed version. Use with:
+        model.t5.decoder.block[layer].layer[2].DenseReluDense.register_hook(hook)
+
+    Args:
+        sae: Loaded JumpReLU SAE.
+        scaling_factor: From training.
+
+    Returns:
+        Hook function compatible with nn.Module.register_forward_hook().
+    """
+    def hook_fn(module, input, output):
+        orig_shape = output.shape
+        flat = output.reshape(-1, orig_shape[-1])
+        scaled = flat * scaling_factor
+        features = sae.encode(scaled)
+        reconstructed = sae.decode(features) / scaling_factor
+        return reconstructed.reshape(orig_shape)
+
+    return hook_fn
+
+
+@torch.no_grad()
 def run_with_intervention(
     text: str,
     model: HookedEncoderDecoder,

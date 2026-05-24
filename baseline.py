@@ -155,6 +155,62 @@ def train():
             accelerator.save(accelerator.unwrap_model(model).state_dict(), f'{save_path}/{epoch}.pt')
 
 
+def test_atomic():
+    os.environ['TOKENIZERS_PARALLELISM'] = 'false'
+    batch_size = 32
+    save_path = 'out/dsi'
+    num_of_new_tokens = 109739
+
+    model = AutoModelForSeq2SeqLM.from_pretrained('google-t5/t5-large')
+    tokenizer = AutoTokenizer.from_pretrained('google-t5/t5-large')
+
+    tokenizer.add_tokens([f'${i}$' for i in range(num_of_new_tokens)])
+    model.resize_token_embeddings(len(tokenizer))
+
+    data = json.load(open('dataset/nq320k/dev.json'))
+
+    dataset = NQDataset(data=data, tokenizer=tokenizer, max_len=32)
+    data_loader = torch.utils.data.DataLoader(dataset, collate_fn=dataset.collate_fn, batch_size=batch_size, shuffle=False, num_workers=8)
+    model = model.cuda()
+    model.eval()
+
+    available = sorted([int(f.split('.')[0]) for f in os.listdir(save_path) if f.endswith('.pt') and f.split('.')[0].isdigit()])
+    if not available:
+        print("No checkpoint found!")
+        return
+    epoch = available[-1]
+    print(f'Loading checkpoint {save_path}/{epoch}.pt')
+    model.load_state_dict(torch.load(f'{save_path}/{epoch}.pt', map_location='cuda'))
+
+    tk0 = tqdm(data_loader, total=len(data_loader))
+    top_k = 10
+    hit1, hit10 = [], []
+    with torch.no_grad():
+        for batch in tk0:
+            batch = {k: v.cuda() for k, v in batch.items()}
+            output = model.generate(
+                input_ids=batch['input_ids'],
+                attention_mask=batch['attention_mask'],
+                max_length=2,
+                num_beams=top_k,
+                num_return_sequences=top_k,
+            )
+            output = tokenizer.batch_decode(output, skip_special_tokens=True)
+            output = [str(x).replace('$', '').strip() for x in output]
+            # Group top-k outputs per query
+            preds = [output[i:i+top_k] for i in range(0, len(output), top_k)]
+
+            batch['labels'][batch['labels'] == -100] = 0
+            labels = tokenizer.batch_decode(batch['labels'], skip_special_tokens=True)
+            labels = [str(x).replace('$', '').strip() for x in labels]
+
+            hit1.extend([int(p[0] == l) for p, l in zip(preds, labels)])
+            hit10.extend([int(l in p) for p, l in zip(preds, labels)])
+            tk0.set_postfix(hit1=sum(hit1)/len(hit1), hit10=sum(hit10)/len(hit10))
+
+    print(f'Epoch {epoch}, Hit@1 = {sum(hit1)/len(hit1):.4f}, Hit@10 = {sum(hit10)/len(hit10):.4f}')
+
+
 def test():
     os.environ['TOKENIZERS_PARALLELISM'] = 'false'
     batch_size = 1
@@ -542,7 +598,8 @@ def tmp():
 
 
 if __name__ == '__main__':
-    train()
+    # train()
+    test_atomic()
     # tmp()
     # exit()
     # # clean_data()
