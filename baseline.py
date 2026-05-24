@@ -104,7 +104,7 @@ class Tree:
 def train():
     accelerator = Accelerator()
     os.environ['TOKENIZERS_PARALLELISM'] = 'false'
-    epochs = 50
+    epochs = 100
     batch_size = 64
     save_path = 'out/dsi'
     model = AutoModelForSeq2SeqLM.from_pretrained('google-t5/t5-large')
@@ -114,6 +114,13 @@ def train():
 
     tokenizer.add_tokens([f'${i}$' for i in range(num_of_new_tokens)])
     model.resize_token_embeddings(len(tokenizer))
+
+    resume_from = 'out/dsi/49.pt'
+    start_epoch = 0
+    if resume_from and os.path.exists(resume_from):
+        accelerator.print(f'Resuming from {resume_from}')
+        model.load_state_dict(torch.load(resume_from, map_location='cpu'))
+        start_epoch = int(os.path.basename(resume_from).split('.')[0]) + 1
 
     data = json.load(open('dataset/nq320k/train.json'))
     # data.extend(json.load(open('dataset/nq320k/qg.json')))
@@ -134,7 +141,7 @@ def train():
     accelerator.print('==>')
     accelerator.print(tokenizer.decode(dataset[128][1]), dataset[128][1])
 
-    for epoch in range(epochs):
+    for epoch in range(start_epoch, epochs):
         accelerator.print(f'Training epoch {epoch}')
         accelerator.wait_for_everyone()
         model.train()
