@@ -11,6 +11,7 @@ import torch
 import json
 from utils.io import write_file, read_file
 import os
+import wandb
 
 
 # train 307373 dev 7830
@@ -106,6 +107,9 @@ def train():
     os.environ['TOKENIZERS_PARALLELISM'] = 'false'
     epochs = 100
     batch_size = 64
+
+    if accelerator.is_local_main_process:
+        wandb.init(project='dsi-atomic', config={'epochs': epochs, 'batch_size': batch_size, 'lr': 2e-4, 'model': 't5-large', 'num_new_tokens': 109739})
     save_path = 'out/dsi'
     model = AutoModelForSeq2SeqLM.from_pretrained('google-t5/t5-large')
     tokenizer = AutoTokenizer.from_pretrained('google-t5/t5-large')
@@ -157,9 +161,14 @@ def train():
             optimizer.zero_grad()
             loss_report.append(loss.item())
             tk0.set_postfix(loss=sum(loss_report) / len(loss_report))
+        avg_loss = sum(loss_report) / len(loss_report)
+        if accelerator.is_local_main_process:
+            wandb.log({'epoch': epoch, 'loss': avg_loss})
         accelerator.wait_for_everyone()
         if accelerator.is_local_main_process and (epoch % 10 == 0 or epoch == epochs - 1):
             accelerator.save(accelerator.unwrap_model(model).state_dict(), f'{save_path}/{epoch}.pt')
+    if accelerator.is_local_main_process:
+        wandb.finish()
 
 
 def test_atomic():
