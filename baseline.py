@@ -194,7 +194,7 @@ def train_semantic():
     model = AutoModelForSeq2SeqLM.from_pretrained('google-t5/t5-large')
     tokenizer = AutoTokenizer.from_pretrained('google-t5/t5-large')
 
-    num_of_new_tokens = 10  # 109739
+    num_of_new_tokens = 30  # 109739
 
     tokenizer.add_tokens([f'${i}$' for i in range(num_of_new_tokens)])
     model.resize_token_embeddings(len(tokenizer))

@@ -2,7 +2,7 @@
 Generate hierarchical semantic DocIDs (DSI algorithm).
 
 Algorithm (k=10, c=100):
-  1. Encode all docs with all-MiniLM-L6-v2
+  1. Encode all docs with all-MiniLM-L6-v2 on GPU
   2. 10-way k-means clustering
   3. Recurse on clusters with >100 docs
   4. Sequential IDs for clusters <=100 docs
@@ -17,17 +17,16 @@ from sklearn.cluster import MiniBatchKMeans
 # ── Config ──
 CORPUS_PATH = "dataset/nq320k/corpus_lite.json"
 OUTPUT_PATH = "dataset/nq320k_id/id.semantic.json"
-K = 10          # branching factor
-C = 100         # recursion stopping threshold
-BATCH_SIZE = 256
-DEVICE = "cpu"
+K = 30
+C = 30
 
 
 def encode(corpus):
-    """Encode with all-MiniLM-L6-v2."""
+    """Encode with all-MiniLM-L6-v2 on GPU."""
     from sentence_transformers import SentenceTransformer
-    model = SentenceTransformer("all-MiniLM-L6-v2", device=DEVICE)
-    return model.encode(corpus, batch_size=BATCH_SIZE,
+
+    model = SentenceTransformer("all-MiniLM-L6-v2", device="cuda")
+    return model.encode(corpus, batch_size=512,
                         show_progress_bar=True, normalize_embeddings=True).astype(np.float32)
 
 
@@ -46,7 +45,6 @@ def generate_ids(embeddings, k=K, c=C):
                              n_init=3, max_iter=100, random_state=None)
     labels = kmeans.fit_predict(embeddings)
 
-    # Group indices by cluster
     clusters = [[] for _ in range(k_eff)]
     for idx, label in enumerate(labels):
         clusters[label].append(idx)
@@ -71,13 +69,13 @@ def main():
     print(f"Corpus: {len(corpus)} docs")
 
     embeddings = encode(corpus)
-    print(f"Embeddings: {embeddings.shape}")
+    print(f"Embeddings: {embeddings.shape}  ({embeddings.nbytes / 1024**2:.0f} MB)")
 
     ids = generate_ids(embeddings)
 
     depths = [len(x) for x in ids]
     unique = len(set(tuple(x) for x in ids))
-    print(f"IDs generated: {len(ids)} docs, {unique} unique "
+    print(f"IDs: {len(ids)} docs, {unique} unique "
           f"(collision {1 - unique / len(ids):.4%})")
     print(f"Depth: {min(depths)} ~ {max(depths)}, "
           f"dist={dict(sorted({d: depths.count(d) for d in set(depths)}.items()))}")

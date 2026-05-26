@@ -17,8 +17,8 @@ from sklearn.cluster import MiniBatchKMeans
 # ── Config ──
 CORPUS_PATH = "dataset/nq320k/corpus_lite.json"
 OUTPUT_PATH = "dataset/nq320k_id/id.semantic.json"
-K = 10
-C = 100
+K = 30
+C = 30
 
 
 def encode(corpus):
