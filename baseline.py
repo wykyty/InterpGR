@@ -171,6 +171,95 @@ def train():
         wandb.finish()
 
 
+def train_semantic():
+    accelerator = Accelerator(mixed_precision="bf16")
+    os.environ['TOKENIZERS_PARALLELISM'] = 'false'
+    epochs = 50
+    batch_size = 512
+    lr = 5e-4
+    save_path = 'out/dsi-semantic'
+
+    if accelerator.is_local_main_process:
+        wandb.init(
+            project='dsi-semantic',
+            config={
+                'epochs': epochs,
+                'batch_size': batch_size,
+                'lr': lr,
+                'model': 't5-large',
+                'num_new_tokens': 10,
+            },
+        )
+
+    model = AutoModelForSeq2SeqLM.from_pretrained('google-t5/t5-large')
+    tokenizer = AutoTokenizer.from_pretrained('google-t5/t5-large')
+
+    num_of_new_tokens = 10  # 109739
+
+    tokenizer.add_tokens([f'${i}$' for i in range(num_of_new_tokens)])
+    model.resize_token_embeddings(len(tokenizer))
+
+    data = json.load(open('dataset/nq320k/train.json'))
+    # data.extend(json.load(open('dataset/nq320k/qg.json')))
+
+    corpus = json.load(open('dataset/nq320k_id/id.semantic.json'))
+    corpus = [''.join([f'${i}$' for i in z]) for z in corpus]
+
+    optimizer = AdamW(model.parameters(), lr)
+
+    dataset = NewNQDataset(data=data, corpus=corpus, tokenizer=tokenizer, max_len=32)
+    accelerator.print(f'data size={len(dataset)}')
+    data_loader = torch.utils.data.DataLoader(dataset, collate_fn=dataset.collate_fn, batch_size=batch_size,
+                                              shuffle=True, num_workers=8)
+
+    model, optimizer, data_loader = accelerator.prepare(model, optimizer, data_loader)
+
+    scheduler = get_constant_schedule(optimizer)
+
+    os.makedirs(save_path, exist_ok=True)
+    accelerator.print(tokenizer.decode(dataset[128][0]))
+    accelerator.print('==>')
+    accelerator.print(tokenizer.decode(dataset[128][1]), dataset[128][1])
+
+    global_step = 0
+    for epoch in range(epochs):
+        accelerator.print(f'Training epoch {epoch}')
+        accelerator.wait_for_everyone()
+        model.train()
+        tk0 = tqdm(data_loader, total=len(data_loader))
+        epoch_losses = []
+        for batch in tk0:
+            out = model(**batch)
+            loss = out.loss
+            accelerator.backward(loss)
+            accelerator.clip_grad_norm_(model.parameters(), 1.)
+            optimizer.step()
+            scheduler.step()
+            optimizer.zero_grad()
+
+            loss_val = loss.item()
+            epoch_losses.append(loss_val)
+            avg_loss = sum(epoch_losses) / len(epoch_losses)
+            tk0.set_postfix(loss=avg_loss)
+
+            if accelerator.is_local_main_process and global_step % 100 == 0:
+                wandb.log({'step': global_step, 'batch_loss': loss_val, 'avg_loss': avg_loss})
+
+            global_step += 1
+
+        epoch_avg_loss = sum(epoch_losses) / len(epoch_losses)
+        if accelerator.is_local_main_process:
+            wandb.log({'epoch': epoch, 'epoch_loss': epoch_avg_loss})
+            if epoch % 10 == 0 or epoch == epochs - 1:
+                accelerator.save(
+                    accelerator.unwrap_model(model).state_dict(),
+                    f'{save_path}/{epoch}.pt'
+                )
+
+    if accelerator.is_local_main_process:
+        wandb.finish()
+
+
 def test_atomic():
     os.environ['TOKENIZERS_PARALLELISM'] = 'false'
     batch_size = 32
@@ -615,7 +704,8 @@ def tmp():
 
 if __name__ == '__main__':
     # train()
-    test_atomic()
+    train_semantic()
+    # test_atomic()
     # tmp()
     # exit()
     # # clean_data()
