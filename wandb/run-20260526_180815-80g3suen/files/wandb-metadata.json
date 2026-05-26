@@ -1,0 +1,40 @@
+{
+  "os": "Linux-4.19.90-2107.6.0.0192.8.oe1.bclinux.x86_64-x86_64-with-glibc2.35",
+  "python": "CPython 3.12.3",
+  "startedAt": "2026-05-26T10:08:15.001846Z",
+  "program": "/root/autodl-tmp/InterpGR/baseline.py",
+  "codePath": "baseline.py",
+  "codePathLocal": "baseline.py",
+  "git": {
+    "remote": "git@gitee.com:snow-immortal/InterpGR.git",
+    "commit": "48c79da5a9387ef262597d3a9b1aa9f4135c15ff"
+  },
+  "email": "202220150143@mail.sdu.edu.cn",
+  "root": "/root/autodl-tmp/InterpGR",
+  "host": "autodl-container-98b24ebe42-eeb7f5f6",
+  "executable": "/root/miniconda3/bin/python",
+  "cpu_count": 56,
+  "cpu_count_logical": 112,
+  "gpu": "NVIDIA A800 80GB PCIe",
+  "gpu_count": 1,
+  "disk": {
+    "/": {
+      "total": "32212254720",
+      "used": "710803456"
+    }
+  },
+  "memory": {
+    "total": "1081304428544"
+  },
+  "gpu_nvidia": [
+    {
+      "name": "NVIDIA A800 80GB PCIe",
+      "memoryTotal": "85899345920",
+      "cudaCores": 6912,
+      "architecture": "Ampere",
+      "uuid": "GPU-359f78a3-07df-5e1f-fabe-0d28cf21b37f"
+    }
+  ],
+  "cudaVersion": "13.0",
+  "writerId": "bh007qyxos084775cxbqrq6p0ca7b3pm"
+}

@@ -11,6 +11,7 @@ import torch
 import json
 from utils.io import write_file, read_file
 import os
+from collections import defaultdict
 import wandb
 
 
@@ -172,17 +173,31 @@ def train():
 
 
 def train_semantic():
-    accelerator = Accelerator()
+    accelerator = Accelerator(mixed_precision="bf16")
     os.environ['TOKENIZERS_PARALLELISM'] = 'false'
-    epochs = 30
-    batch_size = 128
+    epochs = 50
+    batch_size = 512
+    lr = 5e-4
     save_path = 'out/dsi-semantic'
+
+    if accelerator.is_local_main_process:
+        wandb.init(
+            project='dsi-semantic',
+            config={
+                'epochs': epochs,
+                'batch_size': batch_size,
+                'lr': lr,
+                'model': 't5-large',
+                'num_new_tokens': 30,
+            },
+        )
+
     model = AutoModelForSeq2SeqLM.from_pretrained('google-t5/t5-large')
     tokenizer = AutoTokenizer.from_pretrained('google-t5/t5-large')
 
-    num_of_new_tokens = 10  # 109739
+    num_of_new_tokens = 30  # 109739
 
-    tokenizer.add_tokens([f'${i}$' for i in range(num_of_new_tokens)])  # 109739
+    tokenizer.add_tokens([f'${i}$' for i in range(num_of_new_tokens)])
     model.resize_token_embeddings(len(tokenizer))
 
     data = json.load(open('dataset/nq320k/train.json'))
@@ -190,9 +205,8 @@ def train_semantic():
 
     corpus = json.load(open('dataset/nq320k_id/id.semantic.json'))
     corpus = [''.join([f'${i}$' for i in z]) for z in corpus]
-    corpus = [f'${z}$' for z in corpus]
 
-    optimizer = AdamW(model.parameters(), 5e-4)
+    optimizer = AdamW(model.parameters(), lr)
 
     dataset = NewNQDataset(data=data, corpus=corpus, tokenizer=tokenizer, max_len=32)
     accelerator.print(f'data size={len(dataset)}')
@@ -208,12 +222,13 @@ def train_semantic():
     accelerator.print('==>')
     accelerator.print(tokenizer.decode(dataset[128][1]), dataset[128][1])
 
+    global_step = 0
     for epoch in range(epochs):
         accelerator.print(f'Training epoch {epoch}')
         accelerator.wait_for_everyone()
         model.train()
         tk0 = tqdm(data_loader, total=len(data_loader))
-        loss_report = []
+        epoch_losses = []
         for batch in tk0:
             out = model(**batch)
             loss = out.loss
@@ -222,11 +237,28 @@ def train_semantic():
             optimizer.step()
             scheduler.step()
             optimizer.zero_grad()
-            loss_report.append(loss.item())
-            tk0.set_postfix(loss=sum(loss_report) / len(loss_report))
-        accelerator.wait_for_everyone()
+
+            loss_val = loss.item()
+            epoch_losses.append(loss_val)
+            avg_loss = sum(epoch_losses) / len(epoch_losses)
+            tk0.set_postfix(loss=avg_loss)
+
+            if accelerator.is_local_main_process and global_step % 100 == 0:
+                wandb.log({'step': global_step, 'batch_loss': loss_val, 'avg_loss': avg_loss})
+
+            global_step += 1
+
+        epoch_avg_loss = sum(epoch_losses) / len(epoch_losses)
         if accelerator.is_local_main_process:
-            accelerator.save(accelerator.unwrap_model(model).state_dict(), f'{save_path}/{epoch}.pt')
+            wandb.log({'epoch': epoch, 'epoch_loss': epoch_avg_loss})
+            if epoch % 10 == 0 or epoch == epochs - 1:
+                accelerator.save(
+                    accelerator.unwrap_model(model).state_dict(),
+                    f'{save_path}/{epoch}.pt'
+                )
+
+    if accelerator.is_local_main_process:
+        wandb.finish()
 
 
 def test_atomic():
@@ -671,9 +703,125 @@ def tmp():
     print(eval_all(prediction, query_ids))
 
 
+
+
+def test_semantic(eval_all_checkpoints=False):
+    """
+    Evaluate DSI-semantic model with tree-constrained beam search.
+
+    For each checkpoint in out/dsi-semantic/:
+      1. Load model weights
+      2. Generate top-k semantic IDs per query via constrained beam search
+      3. Map generated IDs to doc indices, compute Hits@1 / Hits@10
+
+    Set eval_all_checkpoints=True to test all checkpoints; otherwise tests latest only.
+    """
+    batch_size = 16
+    save_path = 'out/dsi-semantic'
+    num_of_new_tokens = 30
+    top_k = 10
+
+    model = AutoModelForSeq2SeqLM.from_pretrained('google-t5/t5-large')
+    tokenizer = AutoTokenizer.from_pretrained('google-t5/t5-large')
+    tokenizer.add_tokens([f'${i}$' for i in range(num_of_new_tokens)])
+    model.resize_token_embeddings(len(tokenizer))
+    model = model.cuda()
+    model.eval()
+
+    # ── Build corpus ID strings and  id → doc_index mapping ──
+    semantic_ids = json.load(open('dataset/nq320k_id/id.semantic.json'))
+    corpus_strs = [''.join([f'${i}$' for i in z]) for z in semantic_ids]
+
+    # stripped_id_string → list of doc indices
+    id_to_docs = defaultdict(list)
+    for doc_idx, id_str in enumerate(corpus_strs):
+        clean = id_str.replace('$', '')
+        id_to_docs[clean].append(doc_idx)
+
+    # ── Build tree for constrained generation ──
+    corpus_token_ids = [[0] + tokenizer.encode(s) for s in tqdm(corpus_strs, desc="Building tree")]
+    tree = Tree()
+    tree.set_all(corpus_token_ids)
+
+    # ── Dev data ──
+    dev_data = json.load(open('dataset/nq320k/dev.json'))
+    dataset = NewNQDataset(data=dev_data, corpus=corpus_strs, tokenizer=tokenizer, max_len=32)
+    data_loader = torch.utils.data.DataLoader(
+        dataset, collate_fn=dataset.collate_fn, batch_size=batch_size,
+        shuffle=False, num_workers=8,
+    )
+
+    # ── Find checkpoints ──
+    if not os.path.exists(save_path):
+        print(f"ERROR: {save_path} not found!")
+        return
+
+    all_ckpts = sorted([
+        int(f.split('.')[0])
+        for f in os.listdir(save_path)
+        if f.endswith('.pt') and f.split('.')[0].isdigit()
+    ])
+
+    if not all_ckpts:
+        print(f"ERROR: No checkpoints found in {save_path}!")
+        return
+
+    checkpoints = all_ckpts if eval_all_checkpoints else [all_ckpts[-1]]
+    print(f"Checkpoints to evaluate: {checkpoints}")
+
+    # ── Evaluate ──
+    for epoch in checkpoints:
+        ckpt_path = f'{save_path}/{epoch}.pt'
+        print(f'\n=== Epoch {epoch} ({ckpt_path}) ===')
+        model.load_state_dict(torch.load(ckpt_path, map_location='cuda'))
+
+        hit1, hit10 = [], []
+        with torch.no_grad():
+            for batch in tqdm(data_loader, total=len(data_loader), desc=f"Epoch {epoch}"):
+                batch = {k: v.cuda() for k, v in batch.items() if v is not None}
+
+                output = model.generate(
+                    input_ids=batch['input_ids'],
+                    attention_mask=batch['attention_mask'],
+                    max_length=12,
+                    num_beams=top_k,
+                    num_return_sequences=top_k,
+                    prefix_allowed_tokens_fn=tree,
+                )
+
+                decoded = tokenizer.batch_decode(output, skip_special_tokens=True)
+                decoded = [x.replace('$', '').strip() for x in decoded]
+                preds = [decoded[i:i + top_k] for i in range(0, len(decoded), top_k)]
+
+                batch['labels'][batch['labels'] == -100] = 0
+                labels = tokenizer.batch_decode(batch['labels'], skip_special_tokens=True)
+                labels = [x.replace('$', '').strip() for x in labels]
+
+                for pred_list, label in zip(preds, labels):
+                    h1 = label in id_to_docs.get(pred_list[0], [])
+                    hit1.append(int(h1))
+                    h10 = any(label in id_to_docs.get(p, []) for p in pred_list)
+                    hit10.append(int(h10))
+
+        h1 = sum(hit1) / len(hit1)
+        h10 = sum(hit10) / len(hit10)
+        print(f"Epoch {epoch}: Hits@1={h1:.4f}  Hits@10={h10:.4f}")
+
+        try:
+            import wandb as _w
+            if _w.run is not None:
+                _w.log({'eval/hits@1': h1, 'eval/hits@10': h10, 'eval/epoch': epoch})
+        except:
+            pass
+
+    print("\nDone.")
+
+
 if __name__ == '__main__':
     # train()
-    test_atomic()
+    # train_semantic()
+    test_semantic(eval_all_checkpoints=True)
+    # test_atomic()
     # tmp()
     # exit()
     # # clean_data()

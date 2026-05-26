@@ -1,0 +1,72 @@
+_wandb:
+    value:
+        cli_version: 0.27.0
+        e:
+            bh007qyxos084775cxbqrq6p0ca7b3pm:
+                codePath: baseline.py
+                codePathLocal: baseline.py
+                cpu_count: 56
+                cpu_count_logical: 112
+                cudaVersion: "13.0"
+                disk:
+                    /:
+                        total: "32212254720"
+                        used: "710803456"
+                email: 202220150143@mail.sdu.edu.cn
+                executable: /root/miniconda3/bin/python
+                git:
+                    commit: 48c79da5a9387ef262597d3a9b1aa9f4135c15ff
+                    remote: git@gitee.com:snow-immortal/InterpGR.git
+                gpu: NVIDIA A800 80GB PCIe
+                gpu_count: 1
+                gpu_nvidia:
+                    - architecture: Ampere
+                      cudaCores: 6912
+                      memoryTotal: "85899345920"
+                      name: NVIDIA A800 80GB PCIe
+                      uuid: GPU-359f78a3-07df-5e1f-fabe-0d28cf21b37f
+                host: autodl-container-98b24ebe42-eeb7f5f6
+                memory:
+                    total: "1081304428544"
+                os: Linux-4.19.90-2107.6.0.0192.8.oe1.bclinux.x86_64-x86_64-with-glibc2.35
+                program: /root/autodl-tmp/InterpGR/baseline.py
+                python: CPython 3.12.3
+                root: /root/autodl-tmp/InterpGR
+                startedAt: "2026-05-26T10:08:15.001846Z"
+                writerId: bh007qyxos084775cxbqrq6p0ca7b3pm
+        m: []
+        python_version: 3.12.3
+        t:
+            "1":
+                - 1
+                - 5
+                - 11
+                - 49
+                - 53
+                - 71
+            "2":
+                - 1
+                - 5
+                - 11
+                - 41
+                - 49
+                - 53
+                - 71
+            "3":
+                - 2
+                - 16
+            "4": 3.12.3
+            "5": 0.27.0
+            "6": 5.9.0
+            "12": 0.27.0
+            "13": linux-x86_64
+batch_size:
+    value: 512
+epochs:
+    value: 50
+lr:
+    value: 0.0005
+model:
+    value: t5-large
+num_new_tokens:
+    value: 30
