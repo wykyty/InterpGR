@@ -89,14 +89,28 @@ class Tree:
         if isinstance(path, torch.Tensor):
             path = path.cpu().tolist()
         pointer = self.root
-        for i in path:
+        for idx, i in enumerate(path):
             if i not in pointer:
+                # 💥 核心打印点：当树找不到分支时，打印当前的整个历史轨迹
+                from transformers import AutoTokenizer
+                # 临时单例解一下，方便在类里看具体 Token 名字
+                tok = AutoTokenizer.from_pretrained('google-t5/t5-large') 
+                
+                print(f"\n🛑 [约束崩溃提示] 已经生成的 Token ID 序列: {path}")
+                print(f"🛑 转换为文本: {[tok.decode([t]) for t in path]}")
+                print(f"🛑 崩在第 {idx} 步的 Token ID [{i}] (文本: '{tok.decode([i])}'), 该节点在树中无子分支！")
+                print(f"🛑 当前节点合法的下一步 Token IDs 本应是: {list(pointer.keys())}")
+                print(f"🛑 对应文本本应是: {[tok.decode([k]) for k in pointer.keys()]}\n")
+
                 return []
             pointer = pointer[i]
         return list(pointer.keys())
 
     def __call__(self, batch_id, path):
-        return self.find(path)
+        res = self.find(path)
+        if not res:
+            return [1]
+        return res
 
 
 # corpus: "id", 'new_id', '2', "doc", '3', '4', 'en'
@@ -120,7 +134,7 @@ def train():
     tokenizer.add_tokens([f'${i}$' for i in range(num_of_new_tokens)])
     model.resize_token_embeddings(len(tokenizer))
 
-    resume_from = 'out/dsi/49.pt'
+    resume_from = 'out/dsi/60.pt'
     start_epoch = 0
     if resume_from and os.path.exists(resume_from):
         accelerator.print(f'Resuming from {resume_from}')
@@ -284,7 +298,7 @@ def test_atomic():
     if not available:
         print("No checkpoint found!")
         return
-    epoch = available[-1]
+    epoch = 70
     print(f'Loading checkpoint {save_path}/{epoch}.pt')
     model.load_state_dict(torch.load(f'{save_path}/{epoch}.pt', map_location='cuda'))
 
@@ -297,7 +311,7 @@ def test_atomic():
             output = model.generate(
                 input_ids=batch['input_ids'],
                 attention_mask=batch['attention_mask'],
-                max_length=2,
+                max_length=10,
                 num_beams=top_k,
                 num_return_sequences=top_k,
             )
@@ -696,6 +710,7 @@ def tmp():
     from eval import eval_all
     import numpy as np
     prediction = []
+    
     for i in range(len(data)):
         rank = [m for m in range(len(corpus))]
         # np.random.shuffle(rank)
@@ -705,94 +720,87 @@ def tmp():
 
 
 
-def test_semantic(eval_all_checkpoints=False):
-    """
-    Evaluate DSI-semantic model with tree-constrained beam search.
-
-    For each checkpoint in out/dsi-semantic/:
-      1. Load model weights
-      2. Generate top-k semantic IDs per query via constrained beam search
-      3. Map generated IDs to doc indices, compute Hits@1 / Hits@10
-
-    Set eval_all_checkpoints=True to test all checkpoints; otherwise tests latest only.
-    """
+def test_semantic():   # 受限解码出问题了，暂时跑不通
     os.environ['TOKENIZERS_PARALLELISM'] = 'false'
-    batch_size = 1
+    batch_size = 32
     save_path = 'out/dsi-semantic'
     num_of_new_tokens = 30
     top_k = 10
 
     model = AutoModelForSeq2SeqLM.from_pretrained('google-t5/t5-large')
     tokenizer = AutoTokenizer.from_pretrained('google-t5/t5-large')
+
     tokenizer.add_tokens([f'${i}$' for i in range(num_of_new_tokens)])
     model.resize_token_embeddings(len(tokenizer))
-    model = model.cuda()
-    model.eval()
 
-    # ── Build corpus ID strings and id → doc_index mapping ──
-    semantic_ids = json.load(open('dataset/nq320k_id/id.semantic.json'))
-    corpus_strs = [''.join([f'${i}$' for i in z]) for z in semantic_ids]
+    corpus = json.load(open('dataset/nq320k_id/id.semantic.json'))
+    corpus = [''.join([f'${i}$' for i in z]) for z in corpus]
 
     # stripped_id_string → list of doc indices
     id_to_docs = defaultdict(list)
-    for doc_idx, id_str in enumerate(corpus_strs):
+    for doc_idx, id_str in enumerate(corpus):
         clean = id_str.replace('$', '')
         id_to_docs[clean].append(doc_idx)
 
-    # ── Build tree for constrained generation ──
-    corpus_token_ids = [[0] + tokenizer.encode(s) for s in tqdm(corpus_strs, desc="Building tree")]
+    corpus_ids = [[0] + tokenizer.encode(s) for s in tqdm(corpus, desc="Building tree")]
     tree = Tree()
-    tree.set_all(corpus_token_ids)
+    tree.set_all(corpus_ids)
 
-    # ── Dev data ──
-    dev_data = json.load(open('dataset/nq320k/dev.json'))
-    dataset = NewNQDataset(data=dev_data, corpus=corpus_strs, tokenizer=tokenizer, max_len=32)
-    data_loader = torch.utils.data.DataLoader(
-        dataset, collate_fn=dataset.collate_fn, batch_size=batch_size,
-        shuffle=False, num_workers=4,
-    )
+    data = json.load(open('dataset/nq320k/dev.json'))
+    dataset = NewNQDataset(data=data, corpus=corpus, tokenizer=tokenizer, max_len=32)
+    data_loader = torch.utils.data.DataLoader(dataset, collate_fn=dataset.collate_fn, batch_size=batch_size, 
+                                              shuffle=False, num_workers=4)
 
-    # ── Find checkpoints ──
     if not os.path.exists(save_path):
         print(f"ERROR: {save_path} not found!")
         return
 
-    all_ckpts = sorted([
-        int(f.split('.')[0])
-        for f in os.listdir(save_path)
-        if f.endswith('.pt') and f.split('.')[0].isdigit()
-    ])
+    # all_ckpts = sorted([
+    #     int(f.split('.')[0])
+    #     for f in os.listdir(save_path)
+    #     if f.endswith('.pt') and f.split('.')[0].isdigit()
+    # ])
 
-    if not all_ckpts:
-        print(f"ERROR: No checkpoints found in {save_path}!")
-        return
+    # if not all_ckpts:
+    #     print(f"ERROR: No checkpoints found in {save_path}!")
+    #     return
 
-    checkpoints = all_ckpts if eval_all_checkpoints else [all_ckpts[-1]]
+    checkpoints = [40]
     print(f"Checkpoints to evaluate: {checkpoints}")
 
-    # ── Evaluate ──
+    model = model.cuda()
+    model.eval()
     for epoch in checkpoints:
         ckpt_path = f'{save_path}/{epoch}.pt'
         print(f'\n=== Epoch {epoch} ({ckpt_path}) ===')
         model.load_state_dict(torch.load(ckpt_path, map_location='cuda'))
 
+        tk0 = tqdm(data_loader, total=len(data_loader), desc=f"Epoch {epoch}")
         hit1, hit10 = [], []
         with torch.no_grad():
-            for batch in tqdm(data_loader, total=len(data_loader), desc=f"Epoch {epoch}"):
+            for batch in tk0:
                 batch = {k: v.cuda() for k, v in batch.items() if v is not None}
 
                 output = model.generate(
                     input_ids=batch['input_ids'],
                     attention_mask=batch['attention_mask'],
-                    max_length=12,
+                    max_length=20,
                     num_beams=top_k,
                     num_return_sequences=top_k,
                     prefix_allowed_tokens_fn=tree,
                 )
 
+                raw_decoded = tokenizer.batch_decode(output, skip_special_tokens=False)
+
                 decoded = tokenizer.batch_decode(output, skip_special_tokens=True)
                 decoded = [x.replace('$', '').strip() for x in decoded]
                 preds = [decoded[i:i + top_k] for i in range(0, len(decoded), top_k)]
+
+                print("\n" + "="*50)
+                print(f"[DEBUG] 输入 Query 还原: {tokenizer.decode(batch['input_ids'][0], skip_special_tokens=True)}")
+                print(f"[DEBUG] 模型原始输出 Token IDs: {output[0].cpu().tolist()}")
+                print(f"[DEBUG] 模型原始输出 字符串: {raw_decoded[0]}")
+                print("="*50 + "\n")
 
                 batch['labels'][batch['labels'] == -100] = 0
                 labels = tokenizer.batch_decode(batch['labels'], skip_special_tokens=True)
@@ -818,10 +826,264 @@ def test_semantic(eval_all_checkpoints=False):
     print("\nDone.")
 
 
+def test_semantic2(eval_all_checkpoints=False):
+    os.environ['TOKENIZERS_PARALLELISM'] = 'false'
+    batch_size = 64  
+    save_path = 'out/dsi-semantic'
+    num_of_new_tokens = 30
+    top_k = 10
+
+    model = AutoModelForSeq2SeqLM.from_pretrained('google-t5/t5-large')
+    tokenizer = AutoTokenizer.from_pretrained('google-t5/t5-large')
+    tokenizer.add_tokens([f'${i}$' for i in range(num_of_new_tokens)])
+    model.resize_token_embeddings(len(tokenizer))
+    model = model.cuda()
+    model.eval()
+
+    raw_dev_data = json.load(open('dataset/nq320k/dev.json'))
+    
+    semantic_ids = json.load(open('dataset/nq320k_id/id.semantic.json'))
+    corpus_strs = [''.join([f'${i}$' for i in z]) for z in semantic_ids]
+
+    # 建立从 "纯Token ID元组" 到 "文档索引" 的双向映射
+    tuple_to_docs = defaultdict(list)
+    doc_to_tuple = {}
+    
+    for doc_idx, z in enumerate(semantic_ids):
+        # z 是类似于 [14, 7, 19, 2] 的数字列表
+        # 我们把它还原为模型实际训练时的真实 Token ID 序列
+        token_ids = []
+        for token_val in z:
+            # 找到 f"${token_val}$" 在当前 tokenizer 里的真实 ID
+            t_id = tokenizer.convert_tokens_to_ids(f'${token_val}$')
+            token_ids.append(t_id)
+        
+        token_tuple = tuple(token_ids) # 转换为不可变的 tuple 作为字典键
+        tuple_to_docs[token_tuple].append(doc_idx)
+        doc_to_tuple[doc_idx] = token_tuple
+
+    # 3. 规范树的构建
+    corpus_token_ids = [[0] + list(doc_to_tuple[idx]) + [1] for idx in range(len(corpus_strs))]
+    tree = Tree()
+    tree.set_all(corpus_token_ids)
+
+    dataset = NewNQDataset(data=raw_dev_data, corpus=corpus_strs, tokenizer=tokenizer, max_len=32)
+    data_loader = torch.utils.data.DataLoader(
+        dataset, collate_fn=dataset.collate_fn, batch_size=batch_size,
+        shuffle=False, num_workers=4,
+    )
+
+    all_ckpts = sorted([int(f.split('.')[0]) for f in os.listdir(save_path) if f.endswith('.pt') and f.split('.')[0].isdigit()])
+    if not all_ckpts: return
+    checkpoints = [40, 49]
+
+    for epoch in checkpoints:
+        ckpt_path = f'{save_path}/{epoch}.pt'
+        print(f'\n=== Epoch {epoch} ({ckpt_path}) ===')
+        model.load_state_dict(torch.load(ckpt_path, map_location='cuda'))
+
+        hit1, hit10 = [], []
+        data_ptr = 0 
+
+        with torch.no_grad():
+            for batch in tqdm(data_loader, total=len(data_loader), desc=f"Epoch {epoch}"):
+                batch_size_actual = batch['input_ids'].size(0)
+                batch = {k: v.cuda() for k, v in batch.items() if v is not None}
+
+                output = model.generate(
+                    input_ids=batch['input_ids'],
+                    attention_mask=batch['attention_mask'],
+                    max_length=15, 
+                    num_beams=top_k,
+                    num_return_sequences=top_k,
+                    prefix_allowed_tokens_fn=tree,
+                )
+
+                # output 形状: [batch_size * top_k, seq_len]
+                output = output.cpu().tolist()
+
+                # 提取模型生成的纯有效新 Token 序列
+                cleaned_preds = []
+                for seq in output:
+                    # 过滤掉 T5 的控制符：<pad>(0), </s>(1), <unk>(2)
+                    valid_tokens = [t for t in seq if t not in [0, 1, 2]]
+                    cleaned_preds.append(tuple(valid_tokens))
+
+                # 按 top_k 分组
+                preds = [cleaned_preds[i:i + top_k] for i in range(0, len(cleaned_preds), top_k)]
+
+                for b_idx in range(batch_size_actual):
+                    pred_list = preds[b_idx] # 包含了 top_k 个预测 tuple
+                    
+                    # 拿到当前样本真实的 doc_idx (或是原本的ID)
+                    _, true_doc_id = raw_dev_data[data_ptr]
+                    while isinstance(true_doc_id, list):
+                        true_doc_id = true_doc_id[0]
+                    
+                    # 拿到这行真实文档对应的标准语义 Token 元组
+                    true_token_tuple = doc_to_tuple.get(true_doc_id, None)
+
+                    # 判定 Hit@1: 最优预测的元组是否和标签元组完全一致
+                    h1 = (pred_list[0] == true_token_tuple)
+                    hit1.append(int(h1))
+
+                    # 判定 Hit@10: 真实的元组是否在预测的候选集里
+                    h10 = (true_token_tuple in pred_list)
+                    hit10.append(int(h10))
+
+                    data_ptr += 1
+
+        h1 = sum(hit1) / len(hit1)
+        h10 = sum(hit10) / len(hit10)
+        print(f"👉 修复后结果 -> Epoch {epoch}: Hits@1={h1:.4f}  Hits@10={h10:.4f}")
+
+    print("\nDone.")
+
+def test_semantic3(eval_all_checkpoints=False):
+    os.environ['TOKENIZERS_PARALLELISM'] = 'false'
+    batch_size = 16  # top_k放大到100后，beam search会消耗更多显存，建议将batch_size稍微调小（如16或32）以防OOM
+    save_path = 'out/dsi-semantic'
+    num_of_new_tokens = 30
+    top_k = 100  # 🚨 调大至 100 以支持 Hits@100
+
+    model = AutoModelForSeq2SeqLM.from_pretrained('google-t5/t5-large')
+    tokenizer = AutoTokenizer.from_pretrained('google-t5/t5-large')
+    tokenizer.add_tokens([f'${i}$' for i in range(num_of_new_tokens)])
+    model.resize_token_embeddings(len(tokenizer))
+    model = model.cuda()
+    model.eval()
+
+    # 1. 读取原始的 dev.json
+    raw_dev_data = json.load(open('dataset/nq320k/dev.json'))
+    
+    # 2. 读取语义编码，将其直接转化为严格的特殊 Token ID 元组 (Tuple)
+    semantic_ids = json.load(open('dataset/nq320k_id/id.semantic.json'))
+    corpus_strs = [''.join([f'${i}$' for i in z]) for z in semantic_ids]
+
+    # 建立从 "纯Token ID元组" 到 "文档索引" 的双向映射
+    tuple_to_docs = defaultdict(list)
+    doc_to_tuple = {}
+    
+    for doc_idx, z in enumerate(semantic_ids):
+        token_ids = []
+        for token_val in z:
+            t_id = tokenizer.convert_tokens_to_ids(f'${token_val}$')
+            token_ids.append(t_id)
+        
+        token_tuple = tuple(token_ids)
+        tuple_to_docs[token_tuple].append(doc_idx)
+        doc_to_tuple[doc_idx] = token_tuple
+
+    # 3. 规范树的构建
+    corpus_token_ids = [[0] + list(doc_to_tuple[idx]) + [1] for idx in range(len(corpus_strs))]
+    tree = Tree()
+    tree.set_all(corpus_token_ids)
+
+    dataset = NewNQDataset(data=raw_dev_data, corpus=corpus_strs, tokenizer=tokenizer, max_len=32)
+    data_loader = torch.utils.data.DataLoader(
+        dataset, collate_fn=dataset.collate_fn, batch_size=batch_size,
+        shuffle=False, num_workers=4,
+    )
+
+    all_ckpts = sorted([int(f.split('.')[0]) for f in os.listdir(save_path) if f.endswith('.pt') and f.split('.')[0].isdigit()])
+    if not all_ckpts: return
+    checkpoints = all_ckpts if eval_all_checkpoints else [all_ckpts[-1]]
+
+    for epoch in checkpoints:
+        ckpt_path = f'{save_path}/{epoch}.pt'
+        print(f'\n=== Epoch {epoch} ({ckpt_path}) ===')
+        model.load_state_dict(torch.load(ckpt_path, map_location='cuda'))
+
+        # 🚨 丰富指标统计列表
+        hit1, hit10, hit100, mrr_list = [], [], [], []
+        data_ptr = 0 
+
+        with torch.no_grad():
+            for batch in tqdm(data_loader, total=len(data_loader), desc=f"Epoch {epoch}"):
+                batch_size_actual = batch['input_ids'].size(0)
+                batch = {k: v.cuda() for k, v in batch.items() if v is not None}
+
+                output = model.generate(
+                    input_ids=batch['input_ids'],
+                    attention_mask=batch['attention_mask'],
+                    max_length=15, 
+                    num_beams=top_k,
+                    num_return_sequences=top_k,
+                    prefix_allowed_tokens_fn=tree,
+                )
+
+                output = output.cpu().tolist()
+
+                # 提取模型生成的纯有效新 Token 序列
+                cleaned_preds = []
+                for seq in output:
+                    valid_tokens = [t for t in seq if t not in [0, 1, 2]]
+                    cleaned_preds.append(tuple(valid_tokens))
+
+                # 按 top_k 分组
+                preds = [cleaned_preds[i:i + top_k] for i in range(0, len(cleaned_preds), top_k)]
+
+                for b_idx in range(batch_size_actual):
+                    pred_list = preds[b_idx]  # 包含了 100 个候选预测元组
+                    
+                    # 拿到当前样本真实的 doc_idx
+                    _, true_doc_id = raw_dev_data[data_ptr]
+                    while isinstance(true_doc_id, list):
+                        true_doc_id = true_doc_id[0]
+                    
+                    # 拿到这行真实文档对应的标准语义 Token 元组
+                    true_token_tuple = doc_to_tuple.get(true_doc_id, None)
+
+                    # ─── 1. 计算 Hits@K ───
+                    hit1.append(int(pred_list[0] == true_token_tuple))
+                    hit10.append(int(true_token_tuple in pred_list[:10]))
+                    hit100.append(int(true_token_tuple in pred_list[:100]))
+
+                    # ─── 2. 计算 MRR (Mean Reciprocal Rank) ───
+                    rr = 0.0  # Reciprocal Rank 默认为 0
+                    if true_token_tuple in pred_list:
+                        # 找到第一个命中的位置（0-indexed 索引，所以计算排名时要 +1）
+                        rank = pred_list.index(true_token_tuple) + 1
+                        rr = 1.0 / rank
+                    mrr_list.append(rr)
+
+                    data_ptr += 1
+
+        # ─── 打印最终报表 ───
+        h1 = sum(hit1) / len(hit1)
+        h10 = sum(hit10) / len(hit10)
+        h100 = sum(hit100) / len(hit100)
+        mrr = sum(mrr_list) / len(mrr_list)
+        
+        print(f"\n================📊 EPOCH {epoch} EVAL REPORT ================")
+        print(f"Hits@1   : {h1:.4f}")
+        print(f"Hits@10  : {h10:.4f}")
+        print(f"Hits@100 : {h100:.4f}")
+        print(f"MRR      : {mrr:.4f}")
+        print(f"============================================================")
+
+        try:
+            import wandb as _w
+            if _w.run is not None:
+                _w.log({
+                    'eval/hits@1': h1, 
+                    'eval/hits@10': h10, 
+                    'eval/hits@100': h100, 
+                    'eval/mrr': mrr, 
+                    'eval/epoch': epoch
+                })
+        except:
+            pass
+
+    print("\nDone.")
+
 if __name__ == '__main__':
     # train()
-    train_semantic()
     # test_atomic()
+
+    # train_semantic()
+    test_semantic2()
+    
     # tmp()
     # exit()
     # # clean_data()
