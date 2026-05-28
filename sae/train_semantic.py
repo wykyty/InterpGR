@@ -1,24 +1,26 @@
 """
-Train BatchTopK SAE on all decoder MLP layers of a fine-tuned DSI Atomic-Docid model.
+Train BatchTopK SAE on decoder MLP layers of a fine-tuned DSI Semantic-Docid model.
 
-Loads a DSI checkpoint (T5-large + expanded tokenizer), collects decoder MLP
-activations using queries from nq320k/dev.json, and trains a separate SAE
-for each of the 24 decoder layers.
+Supports multi-GPU parallel activation collection: all GPUs run T5-large forward
+passes concurrently, feeding activations to the main GPU for SAE training.
 
-Usage:
-    python sae/train_atomic.py \
-        --checkpoint out/dsi/49.pt \
+Usage (single layer, 8 GPUs):
+    python sae/train_semantic.py \
+        --checkpoint out/dsi-semantic/49.pt \
         --data_path dataset/nq320k/dev.json \
-        --save_dir checkpoints/dsi_sae
+        --save_dir checkpoints/dsi_sae_semantic \
+        --layers 0 --n_gpus 8
 """
 
 import argparse
 import json
 import os
+from multiprocessing import Process, Queue
 from pathlib import Path
 
 import numpy as np
 import torch
+import torch.multiprocessing as mp
 import wandb
 from safetensors.torch import save_file
 from tqdm.auto import tqdm
@@ -29,38 +31,47 @@ from sae_lens.saes.batchtopk_sae import BatchTopKTrainingSAE, BatchTopKTrainingS
 from sae_lens.saes.sae import TrainStepInput
 
 
-def load_dsi_model(checkpoint_path: str, device: str = "cuda") -> tuple:
-    """Load a DSI checkpoint into HookedEncoderDecoder.
+# ---------------------------------------------------------------------------
+# Model loading (same for all GPUs)
+# ---------------------------------------------------------------------------
 
-    The DSI model was trained with T5-large + 109739 expanded tokens.
-    We load the checkpoint into a HF T5 model, then convert to TransformerLens.
-    """
-    print(f"Loading DSI checkpoint from {checkpoint_path}...")
+def load_dsi_model(checkpoint_path: str, device: str = "cuda") -> tuple:
+    """Load a DSI semantic checkpoint into HookedEncoderDecoder."""
+    import transformer_lens.loading_from_pretrained as loading
+    from transformer_lens.pretrained.weight_conversions.t5 import convert_t5_weights
+
+    print(f"Loading DSI semantic checkpoint from {checkpoint_path}...")
 
     tokenizer = AutoTokenizer.from_pretrained("google-t5/t5-large")
-    num_new_tokens = 109739
+    num_new_tokens = 30
     tokenizer.add_tokens([f'${i}$' for i in range(num_new_tokens)])
+    target_vocab = len(tokenizer)
 
     hf_model = T5ForConditionalGeneration.from_pretrained("google-t5/t5-large")
-    hf_model.resize_token_embeddings(len(tokenizer))
+    hf_model.resize_token_embeddings(target_vocab)
 
     state_dict = torch.load(checkpoint_path, map_location="cpu")
-    # Strip 'module.' prefix if saved from DataParallel / Accelerate
     if any(k.startswith("module.") for k in state_dict.keys()):
         state_dict = {k.removeprefix("module."): v for k, v in state_dict.items()}
     hf_model.load_state_dict(state_dict, strict=False)
+    hf_model.eval()
 
-    model = HookedEncoderDecoder.from_pretrained(
-        "google-t5/t5-large",
-        hf_model=hf_model,
-        tokenizer=tokenizer,
-        move_to_device=True,
+    cfg = loading.get_pretrained_model_config(
+        "google-t5/t5-large", fold_ln=False, device=None, n_devices=1,
     )
+    cfg.d_vocab = target_vocab
+    cfg.d_vocab_out = target_vocab
+
+    tl_state_dict = convert_t5_weights(hf_model, cfg)
+
+    model = HookedEncoderDecoder(cfg, tokenizer=tokenizer, move_to_device=False)
+    model.load_state_dict(tl_state_dict, strict=False)
+
+    if device:
+        model.to(device)
     model.eval()
 
-    print(f"  d_model = {model.cfg.d_model}")
-    print(f"  n_layers = {model.cfg.n_layers}")
-    print(f"  vocab_size = {len(tokenizer)}")
+    print(f"  d_model={model.cfg.d_model}  n_layers={model.cfg.n_layers}  vocab={target_vocab}")
     return model, tokenizer
 
 
@@ -83,61 +94,107 @@ def load_queries(data_path: str) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
-# Activation collection
+# Multi-GPU activation collection
 # ---------------------------------------------------------------------------
 
-@torch.no_grad()
-def collect_activations_batch(
+SENTINEL = None  # poison pill to stop workers
+
+
+def _gpu_worker(
+    gpu_id: int,
+    checkpoint_path: str,
     queries: list[str],
-    idx: int,
-    model: HookedEncoderDecoder,
-    tokenizer,
     hook_name: str,
     d_in: int,
     context_size: int,
-    device: str,
-    target_tokens: int = 4096,
-) -> tuple[torch.Tensor, int]:
-    """Collect decoder activations from queries. No decoder input needed.
+    batch_size: int,
+    queue: Queue,
+):
+    """Worker process: loads T5 on its own GPU, continuously collects activations."""
+    device = f"cuda:{gpu_id}"
+    os.environ["TOKENIZERS_PARALLELISM"] = "false"
+    os.environ.setdefault("HF_HUB_OFFLINE", "1")
 
-    Returns (activations, new_idx). Activations shape: [n_tokens, d_in].
-    """
-    collected = []
-    total_tokens = 0
+    model, tokenizer = load_dsi_model(checkpoint_path, device)
+    idx = len(queries) // 8 * gpu_id  # stagger starting points
 
-    while total_tokens < target_tokens:
-        if idx >= len(queries):
-            idx = 0  # wrap around
-        query = queries[idx]
-        idx += 1
+    while True:
+        msg = queue.get()
+        if msg is SENTINEL:
+            break
 
-        enc_tokens = tokenizer(
-            query, return_tensors="pt", truncation=True,
-            max_length=context_size, padding=False,
+        collected = []
+        total_tokens = 0
+        while total_tokens < batch_size:
+            if idx >= len(queries):
+                idx = 0
+            query = queries[idx]
+            idx += 1
+
+            enc_tokens = tokenizer(
+                query, return_tensors="pt", truncation=True,
+                max_length=context_size, padding=False,
+            )
+            dec_input = torch.full(
+                (1, 1), tokenizer.pad_token_id, dtype=torch.long, device=device,
+            )
+
+            with torch.no_grad():
+                _, cache = model.run_with_cache(
+                    enc_tokens.input_ids,
+                    one_zero_attention_mask=enc_tokens.attention_mask,
+                    decoder_input=dec_input,
+                    names_filter=lambda name: name == hook_name,
+                )
+
+            acts = cache[hook_name].squeeze(0).float()
+            collected.append(acts)
+            total_tokens += acts.shape[0]
+
+        all_acts = torch.cat(collected, dim=0)
+        if all_acts.shape[0] > batch_size:
+            indices = torch.randperm(all_acts.shape[0])[:batch_size]
+            all_acts = all_acts[indices]
+        queue.put(all_acts.cpu())  # send to main process
+
+
+def start_gpu_workers(n_gpus, checkpoint_path, queries, hook_name, d_in, context_size, batch_size):
+    """Launch GPU workers and return (queue, processes)."""
+    queue = mp.Queue(maxsize=n_gpus * 2)
+    procs = []
+    for gpu_id in range(n_gpus):
+        p = mp.Process(
+            target=_gpu_worker,
+            args=(gpu_id, checkpoint_path, queries, hook_name, d_in, context_size, batch_size, queue),
+            daemon=True,
         )
+        p.start()
+        procs.append(p)
+    return queue, procs
 
-        # Decoder input: single start token (pad_token_id=0 for T5)
-        dec_input = torch.full((1, 1), tokenizer.pad_token_id, dtype=torch.long, device=device)
 
-        _, cache = model.run_with_cache(
-            enc_tokens.input_ids,
-            one_zero_attention_mask=enc_tokens.attention_mask,
-            decoder_input=dec_input,
-            names_filter=lambda name: name == hook_name,
-        )
+def request_batch(queue, n_gpus):
+    """Signal all workers to produce one batch each."""
+    for _ in range(n_gpus):
+        queue.put("go")
 
-        acts = cache[hook_name].squeeze(0).float()
-        collected.append(acts)
-        total_tokens += acts.shape[0]
 
-    if not collected:
-        return torch.empty(0, d_in, device=device), idx
+def collect_batch(queue, device, d_in, target_tokens):
+    """Receive one batch from queue, move to device."""
+    acts = queue.get()
+    if isinstance(acts, str):  # shouldn't happen, but safety
+        return torch.empty(0, d_in, device=device)
+    return acts.to(device)
 
-    all_acts = torch.cat(collected, dim=0)
-    if all_acts.shape[0] > target_tokens:
-        indices = torch.randperm(all_acts.shape[0])[:target_tokens]
-        all_acts = all_acts[indices]
-    return all_acts, idx
+
+def stop_workers(queue, procs, n_gpus):
+    """Send poison pill to all workers and join."""
+    for _ in range(n_gpus):
+        queue.put(SENTINEL)
+    for p in procs:
+        p.join(timeout=30)
+        if p.is_alive():
+            p.terminate()
 
 
 # ---------------------------------------------------------------------------
@@ -146,12 +203,12 @@ def collect_activations_batch(
 
 def train_layer(
     layer: int,
-    model: HookedEncoderDecoder,
-    tokenizer,
+    checkpoint_path: str,
     queries: list[str],
     d_in: int,
     device: str,
     save_dir: Path,
+    n_gpus: int = 8,
     d_sae: int = 16384,
     k: float = 100.0,
     total_steps: int = 10_000,
@@ -160,45 +217,45 @@ def train_layer(
     context_size: int = 32,
     log_every: int = 100,
     n_batches_for_norm_estimate: int = 50,
-    wandb_project: str = "batchtopk-sae-atomic",
+    wandb_project: str = "batchtopk-sae-semantic",
     wandb_entity: str | None = None,
 ) -> dict:
-    """Train a BatchTopK SAE on one decoder MLP layer. Returns evaluation metrics."""
+    """Train a BatchTopK SAE on one decoder MLP layer using multi-GPU activation collection."""
     hook_name = f"decoder.{layer}.hook_mlp_out"
     layer_dir = save_dir / f"layer_{layer}"
     layer_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"\n{'='*60}")
-    print(f"  Layer {layer}: {hook_name}")
+    print(f"  Layer {layer}: {hook_name}  ({n_gpus} GPUs for activation collection)")
     print(f"{'='*60}")
 
-    # Create SAE
+    # Start GPU workers
+    queue, procs = start_gpu_workers(
+        n_gpus, checkpoint_path, queries, hook_name, d_in, context_size, batch_size,
+    )
+
+    # Create SAE on main device
     sae_cfg = BatchTopKTrainingSAEConfig(
-        d_in=d_in,
-        d_sae=d_sae,
-        k=k,
+        d_in=d_in, d_sae=d_sae, k=k,
         aux_loss_coefficient=1.0,
         rescale_acts_by_decoder_norm=True,
         topk_threshold_lr=0.01,
         apply_b_dec_to_input=False,
         normalize_activations="expected_average_only_in",
         decoder_init_norm=0.1,
-        device=device,
-        dtype="float32",
+        device=device, dtype="float32",
     )
     sae = BatchTopKTrainingSAE(sae_cfg).to(device)
 
     # Estimate scaling factor
     print("Estimating activation scaling factor...")
     norms = []
-    idx = 0
     for i in range(n_batches_for_norm_estimate):
-        batch, idx = collect_activations_batch(
-            queries, idx, model, tokenizer, hook_name, d_in, context_size, device,
-            target_tokens=batch_size,
-        )
-        if batch.shape[0] > 0:
-            norms.append(batch.norm(dim=-1).mean().item())
+        request_batch(queue, n_gpus)
+        for _ in range(n_gpus):
+            batch = collect_batch(queue, device, d_in, batch_size)
+            if batch.shape[0] > 0:
+                norms.append(batch.norm(dim=-1).mean().item())
         if (i + 1) % 10 == 0:
             print(f"  Batch {i + 1}/{n_batches_for_norm_estimate}")
 
@@ -208,16 +265,15 @@ def train_layer(
     print(f"Scaling factor: {scaling_factor:.4f}")
 
     # Wandb
-    run_name = f"layer_{layer}"
     wandb.init(
-        project=wandb_project,
-        entity=wandb_entity,
-        name=run_name,
+        project=wandb_project, entity=wandb_entity,
+        name=f"layer_{layer}",
         config={
             "layer": layer, "hook_name": hook_name,
             "d_in": d_in, "d_sae": d_sae, "k": k,
             "lr": lr, "batch_size": batch_size,
             "total_steps": total_steps, "scaling_factor": scaling_factor,
+            "n_gpus": n_gpus,
         },
         reinit=True,
     )
@@ -234,19 +290,21 @@ def train_layer(
     }
 
     for step in pbar:
-        sae_in, idx = collect_activations_batch(
-            queries, idx, model, tokenizer, hook_name, d_in, context_size, device,
-            target_tokens=batch_size,
-        )
-        if sae_in.shape[0] == 0:
-            continue
+        # Request activations from all GPUs, then collect
+        request_batch(queue, n_gpus)
+        batches = []
+        for _ in range(n_gpus):
+            batch = collect_batch(queue, device, d_in, batch_size)
+            if batch.shape[0] > 0:
+                batches.append(batch)
 
-        sae_in = sae_in * sae.scaling_factor
+        if not batches:
+            continue
+        sae_in = torch.cat(batches, dim=0) * sae.scaling_factor
 
         step_output = sae.training_forward_pass(
             step_input=TrainStepInput(
-                sae_in=sae_in,
-                coefficients={},
+                sae_in=sae_in, coefficients={},
                 dead_neuron_mask=None,
                 n_training_steps=step,
                 is_logging_step=(step % log_every == 0),
@@ -300,13 +358,15 @@ def train_layer(
     all_feature_acts, all_reconstructions, all_inputs = [], [], []
     with torch.no_grad():
         for _ in range(10):
-            batch, idx = collect_activations_batch(
-                queries, idx, model, tokenizer, hook_name, d_in, context_size, device,
-                target_tokens=batch_size,
-            )
-            if batch.shape[0] == 0:
+            request_batch(queue, n_gpus)
+            batches = []
+            for _ in range(n_gpus):
+                batch = collect_batch(queue, device, d_in, batch_size)
+                if batch.shape[0] > 0:
+                    batches.append(batch)
+            if not batches:
                 continue
-            scaled = batch * sae.scaling_factor
+            scaled = torch.cat(batches, dim=0) * sae.scaling_factor
             feature_acts, _ = sae.encode_with_hidden_pre(scaled)
             reconstruction = sae.decode(feature_acts)
             all_feature_acts.append(feature_acts)
@@ -338,6 +398,9 @@ def train_layer(
           f"L0={eval_result['l0']:.1f}  "
           f"Dead={dead_features}/{feature_acts.shape[-1]}")
 
+    # Stop workers
+    stop_workers(queue, procs, n_gpus)
+
     # Save
     log_feature_sparsity = torch.log10(feature_act_freq / total_tokens_seen + 1e-10)
 
@@ -351,7 +414,7 @@ def train_layer(
         json.dump({
             "d_in": d_in, "d_sae": d_sae, "k": k,
             "hook_name": hook_name, "layer": layer,
-            "model_name": "google-t5/t5-large (DSI atomic-docid)",
+            "model_name": "google-t5/t5-large (DSI semantic-docid)",
             "sae_type": "batch_topk_training_sae",
         }, f, indent=2)
 
@@ -365,10 +428,9 @@ def train_layer(
             "layer": layer, "hook_name": hook_name,
             "d_in": d_in, "d_sae": d_sae, "k": k,
             "lr": lr, "batch_size": batch_size, "total_steps": total_steps,
-            "scaling_factor": scaling_factor,
+            "scaling_factor": scaling_factor, "n_gpus": n_gpus,
         }, f, indent=2)
 
-    # Inference format
     inference_dir = layer_dir / "inference"
     sae.save_inference_model(inference_dir)
     save_file({"scaling_factor": torch.tensor(scaling_factor)},
@@ -385,49 +447,62 @@ def train_layer(
 # ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="Train SAE on DSI decoder MLP layers")
-    parser.add_argument("--checkpoint", type=str, required=True, help="DSI checkpoint path")
+    mp.set_start_method("spawn", force=True)
+
+    parser = argparse.ArgumentParser(description="Train SAE on DSI semantic decoder MLP layers")
+    parser.add_argument("--checkpoint", type=str, required=True, help="DSI semantic checkpoint path")
     parser.add_argument("--data_path", type=str, required=True, help="nq320k/dev.json path")
-    parser.add_argument("--save_dir", type=str, default="checkpoints/dsi_sae")
+    parser.add_argument("--save_dir", type=str, default="checkpoints/dsi_sae_semantic")
     parser.add_argument("--layers", type=int, nargs="+", default=None,
                         help="Layer numbers to train (default: all 0-23)")
+    parser.add_argument("--layer_range", type=int, nargs=2, default=None,
+                        metavar=("START", "END"),
+                        help="Layer range [START, END) to train")
+    parser.add_argument("--n_gpus", type=int, default=8, help="Number of GPUs for activation collection")
     parser.add_argument("--d_sae", type=int, default=16384)
     parser.add_argument("--k", type=float, default=100.0)
     parser.add_argument("--total_steps", type=int, default=10000)
     parser.add_argument("--batch_size", type=int, default=4096)
     parser.add_argument("--lr", type=float, default=5e-5)
     parser.add_argument("--context_size", type=int, default=32)
-    parser.add_argument("--wandb_project", type=str, default="batchtopk-sae-atomic")
+    parser.add_argument("--wandb_project", type=str, default="batchtopk-sae-semantic")
     parser.add_argument("--wandb_entity", type=str, default=None)
     args = parser.parse_args()
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = "cuda:0" if torch.cuda.is_available() else "cpu"
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
+    os.environ.setdefault("HF_HUB_OFFLINE", "1")
 
-    model, tokenizer = load_dsi_model(args.checkpoint, device)
     queries = load_queries(args.data_path)
-    d_in = model.cfg.d_model  # 1024
+    d_in = 1024  # T5-large d_model
 
-    layers = args.layers if args.layers else list(range(model.cfg.n_layers))
+    if args.layers:
+        layers = args.layers
+    elif args.layer_range:
+        layers = list(range(args.layer_range[0], args.layer_range[1]))
+    else:
+        layers = list(range(24))
     save_dir = Path(args.save_dir)
 
     print(f"\nWill train SAE on {len(layers)} layers: {layers}")
     print(f"  d_in={d_in}, d_sae={args.d_sae}, k={args.k}")
     print(f"  total_steps={args.total_steps}, batch_size={args.batch_size}")
+    print(f"  n_gpus={args.n_gpus} (parallel activation collection)")
 
     all_results = []
     for layer in layers:
         result = train_layer(
-            layer=layer, model=model, tokenizer=tokenizer,
+            layer=layer, checkpoint_path=args.checkpoint,
             queries=queries, d_in=d_in, device=device,
-            save_dir=save_dir, d_sae=args.d_sae, k=args.k,
+            save_dir=save_dir, n_gpus=args.n_gpus,
+            d_sae=args.d_sae, k=args.k,
             total_steps=args.total_steps, batch_size=args.batch_size,
             lr=args.lr, context_size=args.context_size,
             wandb_project=args.wandb_project, wandb_entity=args.wandb_entity,
         )
         all_results.append(result)
 
-    # Summary table
+    # Summary
     print(f"\n{'='*60}")
     print("  Summary")
     print(f"{'='*60}")
