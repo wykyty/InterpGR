@@ -89,19 +89,8 @@ class Tree:
         if isinstance(path, torch.Tensor):
             path = path.cpu().tolist()
         pointer = self.root
-        for idx, i in enumerate(path):
+        for i in path:
             if i not in pointer:
-                # 💥 核心打印点：当树找不到分支时，打印当前的整个历史轨迹
-                from transformers import AutoTokenizer
-                # 临时单例解一下，方便在类里看具体 Token 名字
-                tok = AutoTokenizer.from_pretrained('google-t5/t5-large') 
-                
-                print(f"\n🛑 [约束崩溃提示] 已经生成的 Token ID 序列: {path}")
-                print(f"🛑 转换为文本: {[tok.decode([t]) for t in path]}")
-                print(f"🛑 崩在第 {idx} 步的 Token ID [{i}] (文本: '{tok.decode([i])}'), 该节点在树中无子分支！")
-                print(f"🛑 当前节点合法的下一步 Token IDs 本应是: {list(pointer.keys())}")
-                print(f"🛑 对应文本本应是: {[tok.decode([k]) for k in pointer.keys()]}\n")
-
                 return []
             pointer = pointer[i]
         return list(pointer.keys())
@@ -117,15 +106,15 @@ class Tree:
 # train: "query", "qid", "new_id", "old_id"
 
 
-def train():
+def train_atomic():
     accelerator = Accelerator()
     os.environ['TOKENIZERS_PARALLELISM'] = 'false'
     epochs = 100
     batch_size = 64
 
     if accelerator.is_local_main_process:
-        wandb.init(project='dsi-atomic', config={'epochs': epochs, 'batch_size': batch_size, 'lr': 2e-4, 'model': 't5-large', 'num_new_tokens': 109739})
-    save_path = 'out/dsi'
+        wandb.init(project='dsi-atomic', config={'epochs': epochs, 'batch_size': batch_size, 'lr': 5e-4, 'model': 't5-large', 'num_new_tokens': 109739})
+    save_path = 'out/dsi-atomic'
     model = AutoModelForSeq2SeqLM.from_pretrained('google-t5/t5-large')
     tokenizer = AutoTokenizer.from_pretrained('google-t5/t5-large')
 
@@ -189,14 +178,18 @@ def train():
 def train_semantic():
     accelerator = Accelerator(mixed_precision="bf16")
     os.environ['TOKENIZERS_PARALLELISM'] = 'false'
-    epochs = 50
-    batch_size = 512
+    epochs = 100
+    batch_size = 64  # per GPU, total = 64 * 8 = 512
     lr = 5e-4
-    save_path = 'out/dsi-semantic'
+    save_path = 'out/dsi-semantic-bert'
+    resume_from = 'out/dsi-semantic-bert/49.pt'  # 设为 None 则从头训练
+    start_epoch = 0
 
     if accelerator.is_local_main_process:
         wandb.init(
-            project='dsi-semantic',
+            project='dsi-semantic-bert',
+            id='hxgsj3h2',  # 接着继续训练
+            resume='allow',
             config={
                 'epochs': epochs,
                 'batch_size': batch_size,
@@ -214,10 +207,15 @@ def train_semantic():
     tokenizer.add_tokens([f'${i}$' for i in range(num_of_new_tokens)])
     model.resize_token_embeddings(len(tokenizer))
 
+    if resume_from and os.path.exists(resume_from):
+        accelerator.print(f'Resuming from {resume_from}')
+        model.load_state_dict(torch.load(resume_from, map_location='cpu'))
+        start_epoch = int(os.path.basename(resume_from).split('.')[0]) + 1
+
     data = json.load(open('dataset/nq320k/train.json'))
     # data.extend(json.load(open('dataset/nq320k/qg.json')))
 
-    corpus = json.load(open('dataset/nq320k_id/id.semantic.json'))
+    corpus = json.load(open('dataset/nq320k_id/id.semantic.bert.json'))
     corpus = [''.join([f'${i}$' for i in z]) for z in corpus]
 
     optimizer = AdamW(model.parameters(), lr)
@@ -237,7 +235,7 @@ def train_semantic():
     accelerator.print(tokenizer.decode(dataset[128][1]), dataset[128][1])
 
     global_step = 0
-    for epoch in range(epochs):
+    for epoch in range(start_epoch, epochs):
         accelerator.print(f'Training epoch {epoch}')
         accelerator.wait_for_everyone()
         model.train()
@@ -723,7 +721,7 @@ def tmp():
 def test_semantic():   # 受限解码出问题了，暂时跑不通
     os.environ['TOKENIZERS_PARALLELISM'] = 'false'
     batch_size = 32
-    save_path = 'out/dsi-semantic'
+    save_path = 'out/dsi-semantic-bert'
     num_of_new_tokens = 30
     top_k = 10
 
@@ -733,7 +731,7 @@ def test_semantic():   # 受限解码出问题了，暂时跑不通
     tokenizer.add_tokens([f'${i}$' for i in range(num_of_new_tokens)])
     model.resize_token_embeddings(len(tokenizer))
 
-    corpus = json.load(open('dataset/nq320k_id/id.semantic.json'))
+    corpus = json.load(open('dataset/nq320k_id/id.semantic.bert.json'))
     corpus = [''.join([f'${i}$' for i in z]) for z in corpus]
 
     # stripped_id_string → list of doc indices
@@ -765,7 +763,7 @@ def test_semantic():   # 受限解码出问题了，暂时跑不通
     #     print(f"ERROR: No checkpoints found in {save_path}!")
     #     return
 
-    checkpoints = [40]
+    checkpoints = [49]
     print(f"Checkpoints to evaluate: {checkpoints}")
 
     model = model.cuda()
@@ -796,11 +794,11 @@ def test_semantic():   # 受限解码出问题了，暂时跑不通
                 decoded = [x.replace('$', '').strip() for x in decoded]
                 preds = [decoded[i:i + top_k] for i in range(0, len(decoded), top_k)]
 
-                print("\n" + "="*50)
-                print(f"[DEBUG] 输入 Query 还原: {tokenizer.decode(batch['input_ids'][0], skip_special_tokens=True)}")
-                print(f"[DEBUG] 模型原始输出 Token IDs: {output[0].cpu().tolist()}")
-                print(f"[DEBUG] 模型原始输出 字符串: {raw_decoded[0]}")
-                print("="*50 + "\n")
+                # print("\n" + "="*50)
+                # print(f"[DEBUG] 输入 Query 还原: {tokenizer.decode(batch['input_ids'][0], skip_special_tokens=True)}")
+                # print(f"[DEBUG] 模型原始输出 Token IDs: {output[0].cpu().tolist()}")
+                # print(f"[DEBUG] 模型原始输出 字符串: {raw_decoded[0]}")
+                # print("="*50 + "\n")
 
                 batch['labels'][batch['labels'] == -100] = 0
                 labels = tokenizer.batch_decode(batch['labels'], skip_special_tokens=True)
@@ -826,10 +824,10 @@ def test_semantic():   # 受限解码出问题了，暂时跑不通
     print("\nDone.")
 
 
-def test_semantic2(eval_all_checkpoints=False):
+def test_semantic2(eval_all_checkpoints=False):  # 可以跑通
     os.environ['TOKENIZERS_PARALLELISM'] = 'false'
-    batch_size = 64  
-    save_path = 'out/dsi-semantic'
+    batch_size = 16   
+    save_path = 'out/dsi-semantic-bert'
     num_of_new_tokens = 30
     top_k = 10
 
@@ -842,7 +840,7 @@ def test_semantic2(eval_all_checkpoints=False):
 
     raw_dev_data = json.load(open('dataset/nq320k/dev.json'))
     
-    semantic_ids = json.load(open('dataset/nq320k_id/id.semantic.json'))
+    semantic_ids = json.load(open('dataset/nq320k_id/id.semantic.bert.json'))
     corpus_strs = [''.join([f'${i}$' for i in z]) for z in semantic_ids]
 
     # 建立从 "纯Token ID元组" 到 "文档索引" 的双向映射
@@ -893,7 +891,7 @@ def test_semantic2(eval_all_checkpoints=False):
                 output = model.generate(
                     input_ids=batch['input_ids'],
                     attention_mask=batch['attention_mask'],
-                    max_length=15, 
+                    max_length=20, 
                     num_beams=top_k,
                     num_return_sequences=top_k,
                     prefix_allowed_tokens_fn=tree,
@@ -939,12 +937,12 @@ def test_semantic2(eval_all_checkpoints=False):
 
     print("\nDone.")
 
-def test_semantic3(eval_all_checkpoints=False):
+def test_semantic3(eval_all_checkpoints=False):  # 可以跑通，topk 扩展到100
     os.environ['TOKENIZERS_PARALLELISM'] = 'false'
-    batch_size = 16  # top_k放大到100后，beam search会消耗更多显存，建议将batch_size稍微调小（如16或32）以防OOM
-    save_path = 'out/dsi-semantic'
+    batch_size = 16  # top_k放大到100，beam search会消耗更多显存，将batch_size稍微调小（如16或32）以防OOM  
+    save_path = 'out/dsi-semantic-bert'
     num_of_new_tokens = 30
-    top_k = 100  # 🚨 调大至 100 以支持 Hits@100
+    top_k = 100  
 
     model = AutoModelForSeq2SeqLM.from_pretrained('google-t5/t5-large')
     tokenizer = AutoTokenizer.from_pretrained('google-t5/t5-large')
@@ -957,7 +955,7 @@ def test_semantic3(eval_all_checkpoints=False):
     raw_dev_data = json.load(open('dataset/nq320k/dev.json'))
     
     # 2. 读取语义编码，将其直接转化为严格的特殊 Token ID 元组 (Tuple)
-    semantic_ids = json.load(open('dataset/nq320k_id/id.semantic.json'))
+    semantic_ids = json.load(open('dataset/nq320k_id/id.semantic.bert.json'))
     corpus_strs = [''.join([f'${i}$' for i in z]) for z in semantic_ids]
 
     # 建立从 "纯Token ID元组" 到 "文档索引" 的双向映射
@@ -987,7 +985,8 @@ def test_semantic3(eval_all_checkpoints=False):
 
     all_ckpts = sorted([int(f.split('.')[0]) for f in os.listdir(save_path) if f.endswith('.pt') and f.split('.')[0].isdigit()])
     if not all_ckpts: return
-    checkpoints = all_ckpts if eval_all_checkpoints else [all_ckpts[-1]]
+    # checkpoints = all_ckpts if eval_all_checkpoints else [all_ckpts[-1]]
+    checkpoints = [30, 40]
 
     for epoch in checkpoints:
         ckpt_path = f'{save_path}/{epoch}.pt'
@@ -1011,6 +1010,18 @@ def test_semantic3(eval_all_checkpoints=False):
                     num_return_sequences=top_k,
                     prefix_allowed_tokens_fn=tree,
                 )
+
+                raw_decoded = tokenizer.batch_decode(output, skip_special_tokens=False)
+
+                decoded = tokenizer.batch_decode(output, skip_special_tokens=True)
+                decoded = [x.replace('$', '').strip() for x in decoded]
+                preds = [decoded[i:i + top_k] for i in range(0, len(decoded), top_k)]
+
+                # print("\n" + "="*50)
+                # print(f"[DEBUG] 输入 Query 还原: {tokenizer.decode(batch['input_ids'][0], skip_special_tokens=True)}")
+                # print(f"[DEBUG] 模型原始输出 Token IDs: {output[0].cpu().tolist()}")
+                # print(f"[DEBUG] 模型原始输出 字符串: {raw_decoded[0]}")
+                # print("="*50 + "\n")
 
                 output = output.cpu().tolist()
 
@@ -1081,8 +1092,8 @@ if __name__ == '__main__':
     # train()
     # test_atomic()
 
-    # train_semantic()
-    test_semantic2()
+    train_semantic()
+    # test_semantic3()
     
     # tmp()
     # exit()

@@ -20,3 +20,6 @@ wheels/
 wandb/
 
 out
+
+# log
+log/
