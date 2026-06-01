@@ -107,13 +107,14 @@ class Tree:
 
 
 def train_atomic():
-    accelerator = Accelerator()
+    accelerator = Accelerator(mixed_precision="bf16")
     os.environ['TOKENIZERS_PARALLELISM'] = 'false'
     epochs = 100
     batch_size = 64
+    lr = 5e-4
 
     if accelerator.is_local_main_process:
-        wandb.init(project='dsi-atomic', config={'epochs': epochs, 'batch_size': batch_size, 'lr': 5e-4, 'model': 't5-large', 'num_new_tokens': 109739})
+        wandb.init(project='dsi-atomic', config={'epochs': epochs, 'batch_size': batch_size, 'lr': lr, 'model': 't5-large', 'num_new_tokens': 109739})
     save_path = 'out/dsi-atomic'
     model = AutoModelForSeq2SeqLM.from_pretrained('google-t5/t5-large')
     tokenizer = AutoTokenizer.from_pretrained('google-t5/t5-large')
@@ -123,7 +124,7 @@ def train_atomic():
     tokenizer.add_tokens([f'${i}$' for i in range(num_of_new_tokens)])
     model.resize_token_embeddings(len(tokenizer))
 
-    resume_from = 'out/dsi/60.pt'
+    resume_from = None
     start_epoch = 0
     if resume_from and os.path.exists(resume_from):
         accelerator.print(f'Resuming from {resume_from}')
@@ -133,7 +134,7 @@ def train_atomic():
     data = json.load(open('dataset/nq320k/train.json'))
     # data.extend(json.load(open('dataset/nq320k/qg.json')))
 
-    optimizer = AdamW(model.parameters(), 2e-4)
+    optimizer = AdamW(model.parameters(), lr)
 
     dataset = NQDataset(data=data, tokenizer=tokenizer, max_len=32)
     accelerator.print(f'data size={len(dataset)}')
@@ -149,12 +150,13 @@ def train_atomic():
     accelerator.print('==>')
     accelerator.print(tokenizer.decode(dataset[128][1]), dataset[128][1])
 
+    global_step = 0
     for epoch in range(start_epoch, epochs):
         accelerator.print(f'Training epoch {epoch}')
         accelerator.wait_for_everyone()
         model.train()
         tk0 = tqdm(data_loader, total=len(data_loader))
-        loss_report = []
+        epoch_losses = []
         for batch in tk0:
             out = model(**batch)
             loss = out.loss
@@ -163,14 +165,22 @@ def train_atomic():
             optimizer.step()
             scheduler.step()
             optimizer.zero_grad()
-            loss_report.append(loss.item())
-            tk0.set_postfix(loss=sum(loss_report) / len(loss_report))
-        avg_loss = sum(loss_report) / len(loss_report)
+
+            loss_val = loss.item()
+            epoch_losses.append(loss_val)
+            avg_loss = sum(epoch_losses) / len(epoch_losses)
+            tk0.set_postfix(loss=avg_loss)
+
+            if accelerator.is_local_main_process and global_step % 100 == 0:
+                wandb.log({'step': global_step, 'batch_loss': loss_val, 'avg_loss': avg_loss})
+
+            global_step += 1
+
+        epoch_avg_loss = sum(epoch_losses) / len(epoch_losses)
         if accelerator.is_local_main_process:
-            wandb.log({'epoch': epoch, 'loss': avg_loss})
-        accelerator.wait_for_everyone()
-        if accelerator.is_local_main_process and (epoch % 10 == 0 or epoch == epochs - 1):
-            accelerator.save(accelerator.unwrap_model(model).state_dict(), f'{save_path}/{epoch}.pt')
+            wandb.log({'epoch': epoch, 'epoch_loss': epoch_avg_loss})
+            if epoch % 10 == 0 or epoch == epochs - 1:
+                accelerator.save(accelerator.unwrap_model(model).state_dict(), f'{save_path}/{epoch}.pt')
     if accelerator.is_local_main_process:
         wandb.finish()
 
@@ -178,11 +188,11 @@ def train_atomic():
 def train_semantic():
     accelerator = Accelerator(mixed_precision="bf16")
     os.environ['TOKENIZERS_PARALLELISM'] = 'false'
-    epochs = 100
+    epochs = 200
     batch_size = 64  # per GPU, total = 64 * 8 = 512
     lr = 5e-4
     save_path = 'out/dsi-semantic-bert'
-    resume_from = 'out/dsi-semantic-bert/49.pt'  # 设为 None 则从头训练
+    resume_from = 'out/dsi-semantic-bert/99.pt'  # 设为 None 则从头训练
     start_epoch = 0
 
     if accelerator.is_local_main_process:
@@ -986,7 +996,7 @@ def test_semantic3(eval_all_checkpoints=False):  # 可以跑通，topk 扩展到
     all_ckpts = sorted([int(f.split('.')[0]) for f in os.listdir(save_path) if f.endswith('.pt') and f.split('.')[0].isdigit()])
     if not all_ckpts: return
     # checkpoints = all_ckpts if eval_all_checkpoints else [all_ckpts[-1]]
-    checkpoints = [30, 40]
+    checkpoints = [100]
 
     for epoch in checkpoints:
         ckpt_path = f'{save_path}/{epoch}.pt'

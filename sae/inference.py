@@ -5,7 +5,7 @@ Loads a trained BatchTopK SAE (converted to JumpReLU for inference) and provides
 utilities for encoding activations, analyzing features, and running logit lens.
 
 Usage:
-    python inference.py --checkpoint checkpoints/batchtopk_sae_t5_large_decoder/inference
+    uv run python sae/inference.py --checkpoint out/dsi_sae_semantic/layer_12/inference
 """
 
 import argparse
@@ -73,7 +73,7 @@ def collect_activations(
         )
         _, cache = model.run_with_cache(
             enc_tokens.input_ids,
-            attention_mask=enc_tokens.attention_mask,
+            one_zero_attention_mask=enc_tokens.attention_mask,
             decoder_input=dec_tokens.input_ids,
             names_filter=lambda name: name == hook_name,
         )
