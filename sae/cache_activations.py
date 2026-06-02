@@ -6,9 +6,10 @@ Uses teacher-forcing: decoder input = target docid shifted right (prepend PAD).
 Usage:
     uv run python sae/cache_activations.py \
         --checkpoint out/dsi-semantic-bert/99.pt \
-        --data_path dataset/nq320k/dev.json \
-        --cache_dir data/activation_cache \
-        --n_gpus 1
+        --data_path dataset/nq320k/train.json \
+        --cache_dir data/activation_cache_train \
+        --n_gpus 1 \
+        --layer 12
 """
 
 import argparse
@@ -95,18 +96,22 @@ def make_decoder_input(semantic_id: list[int], tokenizer, device: str) -> torch.
     return dec_input.to(device)
 
 
-def collect_all_layers(
+def collect_layers(
     checkpoint_path: str,
     queries: list[str],
     semantic_ids: list[list[int]],
     device: str,
     context_size: int,
-) -> list[torch.Tensor]:
-    """Collect activations for all 24 layers on a single GPU."""
-    model, tokenizer = load_dsi_model(checkpoint_path, device)
-    hook_names = [f"decoder.{l}.hook_mlp_out" for l in range(N_LAYERS)]
+    layers: list[int],
+) -> dict[int, torch.Tensor]:
+    """Collect activations for specified layers on a single GPU.
 
-    all_acts = [[] for _ in range(N_LAYERS)]
+    Returns {layer_idx: activations_tensor}.
+    """
+    model, tokenizer = load_dsi_model(checkpoint_path, device)
+    hook_names = [f"decoder.{l}.hook_mlp_out" for l in layers]
+
+    all_acts = {l: [] for l in layers}
 
     for query, sem_id in tqdm(zip(queries, semantic_ids), total=len(queries),
                               desc=f"Collecting on {device}"):
@@ -124,32 +129,35 @@ def collect_all_layers(
                 names_filter=lambda name: name in hook_names,
             )
 
-        for l in range(N_LAYERS):
-            # Shape: (1, dec_len, d_model) → (dec_len, d_model)
-            acts = cache[hook_names[l]].squeeze(0).float().cpu()
+        for l in layers:
+            acts = cache[f"decoder.{l}.hook_mlp_out"].squeeze(0).float().cpu()
             all_acts[l].append(acts)
 
-    return [torch.cat(layer_acts, dim=0) for layer_acts in all_acts]
+    return {l: torch.cat(acts, dim=0) for l, acts in all_acts.items()}
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Pre-collect T5 decoder MLP activations for all layers")
+    parser = argparse.ArgumentParser(description="Pre-collect T5 decoder MLP activations")
     parser.add_argument("--checkpoint", type=str, required=True)
     parser.add_argument("--data_path", type=str, required=True)
     parser.add_argument("--semantic_id_path", type=str, default="dataset/nq320k_id/id.semantic.bert.json")
     parser.add_argument("--cache_dir", type=str, default="data/activation_cache")
+    parser.add_argument("--layer", type=int, nargs="+", default=None,
+                        help="Layer(s) to cache (default: all 0-23)")
     parser.add_argument("--n_gpus", type=int, default=1)
     parser.add_argument("--context_size", type=int, default=32)
     args = parser.parse_args()
 
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
-    # os.environ.setdefault("HF_HUB_OFFLINE", "1")
+    os.environ.setdefault("HF_HUB_OFFLINE", "1")
+
+    layers = args.layer if args.layer else list(range(N_LAYERS))
 
     queries, semantic_ids = load_data(args.data_path, args.semantic_id_path)
     cache_dir = Path(args.cache_dir)
     cache_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"Caching activations for {len(queries)} queries, {N_LAYERS} layers")
+    print(f"Caching activations for {len(queries)} queries, layers {layers}")
     print(f"  Checkpoint:     {args.checkpoint}")
     print(f"  Semantic IDs:   {args.semantic_id_path}")
     print(f"  Cache dir:      {cache_dir}")
@@ -158,23 +166,22 @@ def main():
         import torch.multiprocessing as mp
         mp.set_start_method("spawn", force=True)
         print(f"  GPUs:           {args.n_gpus} (multiprocessing)")
-        # TODO: multi-GPU path
-        raise NotImplementedError("Multi-GPU not yet implemented for this version. Use --n_gpus 1.")
+        raise NotImplementedError("Multi-GPU not yet implemented. Use --n_gpus 1.")
     else:
         print(f"  GPU:            single (cuda:0)")
-        layer_data = collect_all_layers(
-            args.checkpoint, queries, semantic_ids, "cuda:0", args.context_size,
+        layer_data = collect_layers(
+            args.checkpoint, queries, semantic_ids, "cuda:0", args.context_size, layers,
         )
 
     # Save per layer
     print("Saving...")
-    for l in tqdm(range(N_LAYERS), desc="Saving"):
+    for l in tqdm(layer_data.keys(), desc="Saving"):
         save_file({"activations": layer_data[l]}, str(cache_dir / f"layer_{l}.safetensors"))
         print(f"  Layer {l}: {layer_data[l].shape}")
 
     meta = {
         "n_queries": len(queries),
-        "n_layers": N_LAYERS,
+        "layers": layers,
         "context_size": args.context_size,
         "checkpoint": args.checkpoint,
         "semantic_id_path": args.semantic_id_path,
