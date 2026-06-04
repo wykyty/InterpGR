@@ -1,0 +1,320 @@
+import argparse
+import json
+import os
+import sys
+from pathlib import Path
+
+import torch
+from safetensors.torch import load_file
+from tqdm import tqdm
+
+from sae_lens.saes.batchtopk_sae import BatchTopKTrainingSAE, BatchTopKTrainingSAEConfig
+
+# Project root imports
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from baseline import Tree, NewNQDataset
+from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
+
+
+# ---------------------------------------------------------------------------
+# SAE Reconstruction Evaluation
+# ---------------------------------------------------------------------------
+
+class ActivationLoader:
+    """顺序读取缓存激活值，用于评估。"""
+    def __init__(self, cache_dir: str, layer: int):
+        cache_path = Path(cache_dir) / f"layer_{layer}.safetensors"
+        print(f"Loading cached activations from {cache_path}...")
+        data = load_file(str(cache_path))
+        self.activations = data["activations"]
+        self.total_tokens = self.activations.shape[0]
+        self.d_in = self.activations.shape[1]
+        self.current_ptr = 0
+        self.indices = torch.arange(self.total_tokens)
+        print(f"Loaded {self.total_tokens} tokens, d_in={self.d_in}")
+
+    def sample(self, batch_size: int, device: torch.device) -> torch.Tensor | None:
+        if self.current_ptr >= self.total_tokens:
+            return None
+        end = min(self.current_ptr + batch_size, self.total_tokens)
+        batch_indices = self.indices[self.current_ptr : end]
+        self.current_ptr = end
+        return self.activations[batch_indices].to(device)
+
+
+@torch.no_grad()
+def evaluate_reconstruction(sae, loader, device, d_sae, k,
+                            eval_batch_size=2048, eval_batches=500) -> dict:
+    """流式评估 SAE 重建质量，返回指标字典。"""
+    sae.eval()
+    total_mse = 0.0
+    total_variance = 0.0
+    total_nmse = 0.0
+    total_l0 = 0.0
+    total_tokens = 0
+    feature_activated_counts = torch.zeros(d_sae, device=device)
+
+    for _ in tqdm(range(eval_batches), desc="Evaluating reconstruction"):
+        batch = loader.sample(eval_batch_size, device)
+        if batch is None:
+            break
+
+        feature_acts, _ = sae.encode_with_hidden_pre(batch)
+        reconstructions = sae.decode(feature_acts)
+
+        per_token_mse = (reconstructions - batch).pow(2).sum(dim=-1)
+        per_token_var = (batch - batch.mean(0)).pow(2).sum(dim=-1)
+
+        total_mse += per_token_mse.sum().item()
+        total_variance += per_token_var.sum().item()
+        total_nmse += (per_token_mse / (batch.pow(2).sum(dim=-1) + 1e-8)).sum().item()
+
+        active_mask = feature_acts > 0
+        total_l0 += active_mask.sum(-1).float().sum().item()
+        feature_activated_counts += active_mask.float().sum(dim=0)
+        total_tokens += batch.shape[0]
+
+    if total_tokens == 0:
+        print("  No tokens evaluated.")
+        return {}
+
+    final_ev = 1 - (total_mse / (total_variance + 1e-8))
+    final_nmse = total_nmse / total_tokens
+    final_l0 = total_l0 / total_tokens
+    dead_features = (feature_activated_counts == 0).sum().item()
+
+    results = {
+        "tokens": total_tokens, "ev": final_ev, "nmse": final_nmse,
+        "l0": final_l0, "dead": dead_features, "dead_ratio": dead_features / d_sae,
+    }
+
+    print("\n" + "=" * 50)
+    print("[RECONSTRUCTION EVALUATION]")
+    print(f"  Tokens evaluated : {total_tokens}")
+    print(f"  Explained Variance (EV)    : {final_ev:.4f}")
+    print(f"  Normalized MSE (NMSE)      : {final_nmse:.4f}")
+    print(f"  L0 (Average Sparsity)      : {final_l0:.1f} (Target K: {k})")
+    print(f"  Dead Features              : {dead_features}/{d_sae} ({dead_features/d_sae*100:.2f}%)")
+    print("=" * 50)
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Downstream Retrieval Evaluation
+# ---------------------------------------------------------------------------
+
+def make_sae_hook(sae):
+    """创建 forward hook：用 SAE 重建替换 decoder MLP 输出。
+
+    权重已 fold，SAE 直接接受 raw activation，无需 scaling_factor。
+    对应 TransformerLens 的 decoder.{L}.hook_mlp_out。
+    """
+    def hook_fn(module, input, output):
+        orig_shape = output.shape
+        flat = output.reshape(-1, orig_shape[-1])
+        features, _ = sae.encode_with_hidden_pre(flat)
+        reconstructed = sae.decode(features)
+        return reconstructed.reshape(orig_shape)
+    return hook_fn
+
+
+def run_constrained_beam_search(model, data_loader, tree, top_k=100, max_length=15):
+    """Constrained beam search，返回 cleaned token ID tuple 列表。"""
+    all_preds = []
+    for batch in tqdm(data_loader, desc="Beam search"):
+        batch = {k: v.cuda() for k, v in batch.items() if v is not None}
+        output = model.generate(
+            input_ids=batch['input_ids'],
+            attention_mask=batch['attention_mask'],
+            max_length=max_length,
+            num_beams=top_k,
+            num_return_sequences=top_k,
+            prefix_allowed_tokens_fn=tree,
+        )
+        output = output.cpu().tolist()
+        # 提取有效 token（过滤 pad=0, eos=1, unk=2）
+        for seq in output:
+            valid_tokens = tuple(t for t in seq if t not in [0, 1, 2])
+            all_preds.append(valid_tokens)
+    # 按 top_k 分组
+    return [all_preds[i:i + top_k] for i in range(0, len(all_preds), top_k)]
+
+
+def compute_retrieval_metrics(preds, raw_dev_data, doc_to_tuple, top_k=100):
+    """计算 Hits@1/10/100 和 MRR，与 test_semantic3 逻辑一致。"""
+    hit1, hit10, hit100, mrr_list = [], [], [], []
+    for data_ptr, pred_list in enumerate(preds):
+        _, true_doc_id = raw_dev_data[data_ptr]
+        while isinstance(true_doc_id, list):
+            true_doc_id = true_doc_id[0]
+        true_token_tuple = doc_to_tuple.get(true_doc_id, None)
+
+        hit1.append(int(pred_list[0] == true_token_tuple))
+        hit10.append(int(true_token_tuple in pred_list[:10]))
+        hit100.append(int(true_token_tuple in pred_list[:100]))
+
+        rr = 0.0
+        if true_token_tuple in pred_list:
+            rank = pred_list.index(true_token_tuple) + 1
+            rr = 1.0 / rank
+        mrr_list.append(rr)
+
+    n = len(hit1)
+    return {
+        "Hits@1": sum(hit1) / n,
+        "Hits@10": sum(hit10) / n,
+        "Hits@100": sum(hit100) / n,
+        "MRR": sum(mrr_list) / n,
+    }
+
+
+def evaluate_downstream(sae, args, device):
+    """加载 fine-tuned T5，对比 SAE 替换 decoder MLP 前后的检索性能。"""
+    num_of_new_tokens = 30
+    top_k = 100
+
+    # 1. 加载 T5 + fine-tuned checkpoint
+    print(f"\nLoading T5-large from {args.model_name}...")
+    tokenizer = AutoTokenizer.from_pretrained(args.model_name)
+    model = AutoModelForSeq2SeqLM.from_pretrained(args.model_name)
+    tokenizer.add_tokens([f'${i}$' for i in range(num_of_new_tokens)])
+    model.resize_token_embeddings(len(tokenizer))
+    model.load_state_dict(torch.load(args.genret_ckpt, map_location='cpu'))
+    model = model.cuda().eval()
+
+    # 2. 构建语义 ID 映射和 Tree
+    raw_dev_data = json.load(open(args.dev_data))
+    semantic_ids = json.load(open(args.semantic_id_path))
+    corpus_strs = [''.join([f'${i}$' for i in z]) for z in semantic_ids]
+
+    doc_to_tuple = {}
+    for doc_idx, z in enumerate(semantic_ids):
+        token_ids = [tokenizer.convert_tokens_to_ids(f'${v}$') for v in z]
+        doc_to_tuple[doc_idx] = tuple(token_ids)
+
+    corpus_token_ids = [[0] + list(doc_to_tuple[idx]) + [1] for idx in range(len(corpus_strs))]
+    tree = Tree()
+    tree.set_all(corpus_token_ids)
+
+    dataset = NewNQDataset(data=raw_dev_data, corpus=corpus_strs, tokenizer=tokenizer, max_len=32)
+    data_loader = torch.utils.data.DataLoader(
+        dataset, collate_fn=dataset.collate_fn,
+        batch_size=args.retrieval_batch_size, shuffle=False, num_workers=4,
+    )
+
+    # 3. Baseline (no hook)
+    print("\n--- Baseline (no SAE) ---")
+    # preds_baseline = run_constrained_beam_search(model, data_loader, tree, top_k)
+    # baseline_metrics = compute_retrieval_metrics(preds_baseline, raw_dev_data, doc_to_tuple, top_k)
+    baseline_metrics = {
+        "Hits@1": 0.4448,
+        "Hits@10": 0.5570,
+        "Hits@100": 0.6207,
+        "MRR": 0.4857
+    }
+    for k, v in baseline_metrics.items():
+        print(f"  {k}: {v:.4f}")
+
+    # 4. SAE replacement
+    print(f"\n--- SAE Replacement (layer {args.hook_layer}) ---")
+    hook_target = model.decoder.block[args.hook_layer].layer[2].DenseReluDense
+    hook_fn = make_sae_hook(sae)
+    hook = hook_target.register_forward_hook(hook_fn)
+
+    preds_sae = run_constrained_beam_search(model, data_loader, tree, top_k)
+    sae_metrics = compute_retrieval_metrics(preds_sae, raw_dev_data, doc_to_tuple, top_k)
+    for k, v in sae_metrics.items():
+        print(f"  {k}: {v:.4f}")
+
+    hook.remove()
+
+    # 5. Comparison table
+    print("\n--- Comparison ---")
+    header = f"{'Metric':<12} {'Baseline':>10} {'SAE':>10} {'Delta':>10}"
+    print(header)
+    print("-" * len(header))
+    for k in baseline_metrics:
+        b = baseline_metrics[k]
+        s = sae_metrics[k]
+        delta = s - b
+        sign = "+" if delta >= 0 else ""
+        print(f"{k:<12} {b:>10.4f} {s:>10.4f} {sign}{delta:>9.4f}")
+
+    return {"baseline": baseline_metrics, "sae": sae_metrics}
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser(description="Evaluate SAE: reconstruction + downstream retrieval")
+
+    # SAE checkpoint
+    parser.add_argument("--cache_dir", type=str, required=True, help="Activation cache dir")
+    parser.add_argument("--checkpoint_dir", type=str, required=True, help="Path to layer_X directory")
+    parser.add_argument("--eval_batch_size", type=int, default=2048)
+    parser.add_argument("--eval_batches", type=int, default=500)
+
+    # Downstream retrieval (optional)
+    parser.add_argument("--downstream", action="store_true", help="Run downstream retrieval evaluation")
+    parser.add_argument("--model_name", type=str, default="google-t5/t5-large")
+    parser.add_argument("--genret_ckpt", type=str, help="Fine-tuned T5 checkpoint (.pt)")
+    parser.add_argument("--semantic_id_path", type=str, default="dataset/nq320k_id/id.semantic.bert.json")
+    parser.add_argument("--dev_data", type=str, default="dataset/nq320k/dev.json")
+    parser.add_argument("--retrieval_batch_size", type=int, default=16)
+    parser.add_argument("--hook_layer", type=int, default=12, help="Decoder layer to hook")
+
+    args = parser.parse_args()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # 1. 读取配置 & 初始化 SAE
+    checkpoint_path = Path(args.checkpoint_dir)
+    with open(checkpoint_path / "sae_config.json", "r") as f:
+        sae_cfg_json = json.load(f)
+
+    layer = sae_cfg_json["layer"]
+    d_in = sae_cfg_json["d_in"]
+    d_sae = sae_cfg_json["d_sae"]
+    k = sae_cfg_json["k"]
+
+    sae_cfg = BatchTopKTrainingSAEConfig(
+        d_in=d_in, d_sae=d_sae, k=k,
+        aux_loss_coefficient=1.0, rescale_acts_by_decoder_norm=True,
+        topk_threshold_lr=0.1, apply_b_dec_to_input=False,
+        normalize_activations="expected_average_only_in", decoder_init_norm=0.01,
+        device=str(device), dtype="float32",
+    )
+    sae = BatchTopKTrainingSAE(sae_cfg).to(device)
+
+    # 2. 加载权重 (已 fold，scaling_factor 已 bake 进 W_enc/W_dec/b_dec)
+    print(f"Loading weights from {checkpoint_path}...")
+    weights = load_file(str(checkpoint_path / "sae_weights.safetensors"))
+    sae.W_enc.data = weights["W_enc"].to(device)
+    sae.W_dec.data = weights["W_dec"].to(device)
+    sae.b_enc.data = weights["b_enc"].to(device)
+    sae.b_dec.data = weights["b_dec"].to(device)
+    sae.topk_threshold = weights["topk_threshold"].to(device)
+    sae.eval()
+
+    # 3. 重建质量评估
+    loader = ActivationLoader(args.cache_dir, layer)
+    recon_results = evaluate_reconstruction(
+        sae, loader, device, d_sae, k,
+        eval_batch_size=args.eval_batch_size,
+        eval_batches=args.eval_batches,
+    )
+
+    # 4. 下游检索评估
+    if args.downstream:
+        if not args.genret_ckpt:
+            print("Error: --downstream requires --genret_ckpt")
+            sys.exit(1)
+        downstream_results = evaluate_downstream(sae, args, device)
+
+    print("\nDone!")
+
+
+if __name__ == "__main__":
+    main()

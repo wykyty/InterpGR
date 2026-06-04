@@ -33,7 +33,6 @@ class ActivationLoader:
     def sample(self, batch_size: int, device: torch.device) -> torch.Tensor:
         if self.current_ptr + batch_size > self.total_tokens:
             self.reset_stream()
-            
         batch_indices = self.indices[self.current_ptr : self.current_ptr + batch_size]
         self.current_ptr += batch_size
         return self.activations[batch_indices].to(device)
@@ -152,39 +151,16 @@ def train(args):
             })
 
     pbar.close()
+
+    # Fold scaling factor into weights (与 SAELens SAETrainer 保持一致)
+    # 之后 SAE 直接接受 raw activation，无需手动乘 scaling_factor
+    sae.fold_activation_norm_scaling_factor(scaling_factor)
+
     if not args.no_wandb:
         import wandb
         wandb.finish()
 
-    # Evaluation & Save
-    # print("Evaluating on fresh tokens...")
-    # sae.eval()
-    # all_feature_acts, all_reconstructions, all_inputs = [], [], []
-    # with torch.no_grad():
-    #     # 用 20 个 batch 评估，覆盖更多 token
-    #     for _ in range(20):
-    #         batch = loader.sample(args.batch_size, device) * sae.scaling_factor
-    #         feature_acts, _ = sae.encode_with_hidden_pre(batch)
-    #         all_feature_acts.append(feature_acts)
-    #         all_reconstructions.append(sae.decode(feature_acts))
-    #         all_inputs.append(batch)
-
-    # feature_acts = torch.cat(all_feature_acts, dim=0)
-    # reconstructions = torch.cat(all_reconstructions, dim=0)
-    # inputs = torch.cat(all_inputs, dim=0)
-
-    # per_token_mse = (reconstructions - inputs).pow(2).sum(dim=-1)
-    # total_var = (inputs - inputs.mean(0)).pow(2).sum(dim=-1)
-    # explained_variance = 1 - per_token_mse.mean() / (total_var.mean() + 1e-8)
-    # nmse = (per_token_mse / (inputs.pow(2).sum(dim=-1) + 1e-8)).mean()
-    # active = feature_acts.bool().float()
-    # l0 = active.sum(-1).mean()
-    # dead_features = (active.mean(0) < 1e-6).sum().item()
-
-    # print(f"\n[Final Eval] EV={explained_variance:.4f}  NMSE={nmse:.4f}  L0={l0:.1f}  "
-    #       f"Dead={dead_features}/{feature_acts.shape[-1]} ({dead_features/feature_acts.shape[-1]*100:.2f}%)")
-
-    # Save 
+    # Save
     save_dir = Path(args.save_dir) / f"layer_{args.layer}"
     save_dir.mkdir(parents=True, exist_ok=True)
     log_feature_sparsity = torch.log10(feature_act_freq / total_tokens_seen + 1e-10)
@@ -193,7 +169,7 @@ def train(args):
     save_file({
         "W_enc": sae.W_enc.data, "W_dec": sae.W_dec.data,
         "b_enc": sae.b_enc.data, "b_dec": sae.b_dec.data,
-        "scaling_factor": sae.scaling_factor, "topk_threshold": sae.topk_threshold,
+        "topk_threshold": sae.topk_threshold,
     }, str(save_dir / "sae_weights.safetensors"))
 
     with open(save_dir / "sae_config.json", "w") as f:
@@ -206,7 +182,6 @@ def train(args):
     
     inference_dir = save_dir / "inference"
     sae.save_inference_model(inference_dir)
-    save_file({"scaling_factor": torch.tensor(scaling_factor)}, str(inference_dir / "scaling_factor.safetensors"))
     save_file({"sparsity": log_feature_sparsity}, str(inference_dir / "sparsity.safetensors"))
     print(f"Saved successfully to {save_dir}")
 
