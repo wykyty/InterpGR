@@ -8,6 +8,7 @@ import torch
 import torch.nn as nn
 from safetensors.torch import save_file, load_file
 from tqdm.auto import tqdm
+from transformers import get_cosine_schedule_with_warmup
 
 from sae_lens.saes.batchtopk_sae import BatchTopKTrainingSAE, BatchTopKTrainingSAEConfig
 from sae_lens.saes.sae import TrainStepInput
@@ -48,10 +49,19 @@ def train(args):
 
     # Create SAE
     sae_cfg = BatchTopKTrainingSAEConfig(
-        d_in=d_in, d_sae=args.d_sae, k=args.k,
-        aux_loss_coefficient=1.0, rescale_acts_by_decoder_norm=True,
-        topk_threshold_lr=0.01, apply_b_dec_to_input=False,
-        normalize_activations="expected_average_only_in", decoder_init_norm=0.1,
+        d_in=d_in, 
+        d_sae=args.d_sae, 
+        k=args.k,
+        aux_loss_coefficient=1.0, 
+        
+        # use_error_term_for_dead_neurons=True, 
+        # dead_feature_threshold=1e-6,
+
+        rescale_acts_by_decoder_norm=True,
+        topk_threshold_lr=0.01, 
+        apply_b_dec_to_input=False,
+        normalize_activations="expected_average_only_in", 
+        decoder_init_norm=0.1,
         device=str(device), dtype="float32",
     )
     sae = BatchTopKTrainingSAE(sae_cfg).to(device)
@@ -87,6 +97,13 @@ def train(args):
     optimizer = torch.optim.Adam(sae.parameters(), lr=args.lr, betas=(0.9, 0.999))
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.total_steps, eta_min=1e-6)
     
+    # 增加学习率预热
+    scheduler = get_cosine_schedule_with_warmup(
+        optimizer=optimizer,
+        num_warmup_steps=1500,        # 预热步数
+        num_training_steps=args.total_steps # 总训练步数
+    )
+
     sae.train()
 
     pbar = tqdm(range(args.total_steps), desc=f"Layer {args.layer}")
