@@ -7,12 +7,41 @@
 #         --n_gpus 1
 
 
-CUDA_VISIBLE_DEVICES=0 uv run python sae/cache_activations.py \
+CUDA_VISIBLE_DEVICES=1 uv run python sae/cache_activations.py \
         --checkpoint out/dsi-semantic-bert/99.pt \
         --data_path dataset/nq320k/train.json \
         --cache_dir data/activation_cache \
         --n_gpus 1 \
-        --layer 20
+        --layer 14
+
+CUDA_VISIBLE_DEVICES=2 uv run python sae/cache_activations.py \
+        --checkpoint out/dsi-semantic-bert/99.pt \
+        --data_path dataset/nq320k/train.json \
+        --cache_dir data/activation_cache \
+        --n_gpus 1 \
+        --layer 15
+
+CUDA_VISIBLE_DEVICES=3 uv run python sae/cache_activations.py \
+        --checkpoint out/dsi-semantic-bert/99.pt \
+        --data_path dataset/nq320k/train.json \
+        --cache_dir data/activation_cache \
+        --n_gpus 1 \
+        --layer 16
+
+CUDA_VISIBLE_DEVICES=4 uv run python sae/cache_activations.py \
+        --checkpoint out/dsi-semantic-bert/99.pt \
+        --data_path dataset/nq320k/train.json \
+        --cache_dir data/activation_cache \
+        --n_gpus 1 \
+        --layer 17
+
+CUDA_VISIBLE_DEVICES=5 uv run python sae/cache_activations.py \
+        --checkpoint out/dsi-semantic-bert/99.pt \
+        --data_path dataset/nq320k/train.json \
+        --cache_dir data/activation_cache \
+        --n_gpus 1 \
+        --layer 18
+
 
 uv run torchrun --nproc_per_node=8 sae/train_sae.py \
         --cache_dir data/activation_cache_dev \
@@ -20,7 +49,7 @@ uv run torchrun --nproc_per_node=8 sae/train_sae.py \
         --layer 12 --save_dir out/sae_semantic_dev
 
 uv run torchrun --nproc_per_node=8 sae/train_sae.py \
-        --cache_dir data/activation_cache_train \
+        --cache_dir data/activation_cache \
         --lr 3e-4 \
         --total_steps 30000 \
         --layer 2 --save_dir out/sae_semantic_train2 > log/train_semantic_bert_3.log 2>&1 &
@@ -29,7 +58,7 @@ uv run torchrun --nproc_per_node=8 sae/train_sae.py \
 # 使用gemini优化版本，单卡跑3w步，吃满batch_size
 export HF_ENDPOINT=https://hf-mirror.com
 CUDA_VISIBLE_DEVICES=1 uv run python sae/train_sae.py \
-    --cache_dir data/activation_cache_train \
+    --cache_dir data/activation_cache \
     --lr 3e-4 \
     --total_steps 30000 \
     --batch_size 16384 \
@@ -50,7 +79,7 @@ CUDA_VISIBLE_DEVICES=2 uv run python sae/train_sae.py \
 # 3 OOM
 # export HF_ENDPOINT=https://hf-mirror.com
 # CUDA_VISIBLE_DEVICES=3 uv run python sae/train_sae.py \
-#     --cache_dir data/activation_cache_train \
+#     --cache_dir data/activation_cache \
 #     --lr 6e-4 \
 #     --total_steps 30000 \
 #     --batch_size 49152 \
@@ -62,7 +91,7 @@ CUDA_VISIBLE_DEVICES=2 uv run python sae/train_sae.py \
 # 降低一下
 export HF_ENDPOINT=https://hf-mirror.com
 CUDA_VISIBLE_DEVICES=3 uv run python sae/train_sae.py \
-    --cache_dir data/activation_cache_train \
+    --cache_dir data/activation_cache \
     --lr 4e-4 \
     --total_steps 30000 \
     --batch_size 32768 \
@@ -72,7 +101,7 @@ CUDA_VISIBLE_DEVICES=3 uv run python sae/train_sae.py \
 # 5 可以
 export HF_ENDPOINT=https://hf-mirror.com
 CUDA_VISIBLE_DEVICES=2 uv run python sae/train_sae.py \
-    --cache_dir data/activation_cache_train \
+    --cache_dir data/activation_cache \
     --lr 4e-4 \
     --total_steps 30000 \
     --batch_size 32768 \
@@ -82,7 +111,7 @@ CUDA_VISIBLE_DEVICES=2 uv run python sae/train_sae.py \
 
 
 CUDA_VISIBLE_DEVICES=1 uv run python sae/train_sae.py \
-    --cache_dir data/activation_cache_train \
+    --cache_dir data/activation_cache \
     --lr 4e-4 \
     --total_steps 30000 \
     --batch_size 32768 \
@@ -90,7 +119,7 @@ CUDA_VISIBLE_DEVICES=1 uv run python sae/train_sae.py \
     --save_dir out/sae_train7 > log/sae_train7.log 2>&1 &
 
 CUDA_VISIBLE_DEVICES=3 uv run python sae/train_sae.py \
-    --cache_dir data/activation_cache_train \
+    --cache_dir data/activation_cache \
     --lr 4e-4 \
     --total_steps 30000 \
     --batch_size 32768 \
@@ -98,7 +127,7 @@ CUDA_VISIBLE_DEVICES=3 uv run python sae/train_sae.py \
     --save_dir out/sae_train8 > log/sae_train8.log 2>&1 &
 
 CUDA_VISIBLE_DEVICES=3 uv run python sae/train_sae.py \
-    --cache_dir data/activation_cache_train \
+    --cache_dir data/activation_cache \
     --lr 4e-4 \
     --d_sae 4096 \
     --total_steps 30000 \
@@ -107,7 +136,7 @@ CUDA_VISIBLE_DEVICES=3 uv run python sae/train_sae.py \
     --save_dir out/sae_train9 > log/sae_train9.log 2>&1 &
 
 CUDA_VISIBLE_DEVICES=4 uv run python sae/train_sae.py \
-    --cache_dir data/activation_cache_train \
+    --cache_dir data/activation_cache \
     --lr 4e-4 \
     --d_sae 8192 \
     --total_steps 30000 \
@@ -117,7 +146,7 @@ CUDA_VISIBLE_DEVICES=4 uv run python sae/train_sae.py \
 
 
 CUDA_VISIBLE_DEVICES=4 uv run python sae/train_sae.py \
-    --cache_dir data/activation_cache_train \
+    --cache_dir data/activation_cache \
     --lr 4e-4 \
     --d_sae 4096 \
     --total_steps 30000 \
@@ -127,7 +156,7 @@ CUDA_VISIBLE_DEVICES=4 uv run python sae/train_sae.py \
 
 
 CUDA_VISIBLE_DEVICES=3 uv run python sae/train_sae.py \
-    --cache_dir data/activation_cache_train \
+    --cache_dir data/activation_cache \
     --lr 4e-4 \
     --d_sae 8193 \
     --total_steps 30000 \
@@ -136,66 +165,96 @@ CUDA_VISIBLE_DEVICES=3 uv run python sae/train_sae.py \
     --save_dir out/sae_train12 > log/sae_train12.log 2>&1 &
 
 
+CUDA_VISIBLE_DEVICES=5 uv run python sae/train_sae.py \
+    --cache_dir data/activation_cache \
+    --lr 4e-4 \
+    --d_sae 8192 \
+    --total_steps 30000 \
+    --batch_size 32768 \
+    --layer 0 \
+    --save_dir out/sae_train_8x > log/sae_train_8x/layer0.log 2>&1 &
+
+
+CUDA_VISIBLE_DEVICES=6 uv run python sae/train_sae.py \
+    --cache_dir data/activation_cache \
+    --lr 4e-4 \
+    --d_sae 8192 \
+    --total_steps 30000 \
+    --batch_size 32768 \
+    --layer 1 \
+    --save_dir out/sae_train_8x > log/sae_train_8x/layer1.log 2>&1 &
+
+
+CUDA_VISIBLE_DEVICES=7 uv run python sae/train_sae.py \
+    --cache_dir data/activation_cache \
+    --lr 4e-4 \
+    --d_sae 8192 \
+    --total_steps 30000 \
+    --batch_size 32768 \
+    --layer 2 \
+    --save_dir out/sae_train_8x > log/sae_train_8x/layer2.log 2>&1 &
+
+
 
 
 #--------------------------------------------
 
 # 评估一下 2
 uv run python sae/eval_sae.py \
-    --cache_dir data/activation_cache_train \
+    --cache_dir data/activation_cache \
     --checkpoint_dir out/sae_semantic_train2/layer_2 \
     --eval_batch_size 2048 \
     --eval_batches 100
 
 # 评估一下 5
 uv run python sae/eval_sae.py \
-    --cache_dir data/activation_cache_train \
+    --cache_dir data/activation_cache \
     --checkpoint_dir out/sae_semantic_train5/layer_12 \
     --eval_batch_size 2048 \
     --eval_batches 100
 
 # 评估
 uv run python sae/eval_sae.py \
-    --cache_dir data/activation_cache_train \
+    --cache_dir data/activation_cache \
     --checkpoint_dir out/sae_semantic_train/layer_2 \
     --eval_batch_size 2048 \
     --eval_batches 100
 
 uv run python sae/eval_sae.py \
-    --cache_dir data/activation_cache_train \
+    --cache_dir data/activation_cache \
     --checkpoint_dir out/sae_train7/layer_12 \
     --eval_batch_size 2048 \
     --eval_batches 100
 
 uv run python sae/eval_sae.py \
-    --cache_dir data/activation_cache_train \
+    --cache_dir data/activation_cache \
     --checkpoint_dir out/sae_train8/layer_12 \
     --eval_batch_size 2048 \
     --eval_batches 100
 
 CUDA_VISIBLE_DEVICES=1 uv run python sae/eval_sae.py \
-    --cache_dir data/activation_cache_train \
+    --cache_dir data/activation_cache \
     --checkpoint_dir out/sae_semantic_train5/layer_12 \
     --downstream \
     --genret_ckpt out/dsi-semantic-bert/99.pt \
     --hook_layer 12
 
 CUDA_VISIBLE_DEVICES=1 uv run python sae/eval_sae.py \
-    --cache_dir data/activation_cache_train \
+    --cache_dir data/activation_cache \
     --checkpoint_dir out/sae_train9/layer_12 \
     --downstream \
     --genret_ckpt out/dsi-semantic-bert/99.pt \
     --hook_layer 12
 
 CUDA_VISIBLE_DEVICES=1 uv run python sae/eval_sae.py \
-    --cache_dir data/activation_cache_train \
+    --cache_dir data/activation_cache \
     --checkpoint_dir out/sae_train11/layer_20 \
     --downstream \
     --genret_ckpt out/dsi-semantic-bert/99.pt \
     --hook_layer 20
 
 CUDA_VISIBLE_DEVICES=2 uv run python sae/eval_sae.py \
-    --cache_dir data/activation_cache_train \
+    --cache_dir data/activation_cache \
     --checkpoint_dir out/sae_train12/layer_20 \
     --downstream \
     --genret_ckpt out/dsi-semantic-bert/99.pt \

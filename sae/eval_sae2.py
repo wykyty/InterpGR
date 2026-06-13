@@ -8,7 +8,7 @@ import torch
 from safetensors.torch import load_file
 from tqdm import tqdm
 
-from sae_lens.saes.batchtopk_sae import BatchTopKTrainingSAE, BatchTopKTrainingSAEConfig
+from sae_lens.saes.jumprelu_sae import JumpReLUSAE, JumpReLUSAEConfig
 
 # Project root imports
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -43,7 +43,7 @@ class ActivationLoader:
 
 
 @torch.no_grad()
-def evaluate_reconstruction(sae, loader, device, d_sae, k,
+def evaluate_reconstruction(sae, loader, device, d_sae,
                             eval_batch_size=2048, eval_batches=500) -> dict:
     """流式评估 SAE 重建质量，返回指标字典。"""
     sae.eval()
@@ -59,7 +59,7 @@ def evaluate_reconstruction(sae, loader, device, d_sae, k,
         if batch is None:
             break
 
-        feature_acts, _ = sae.encode_with_hidden_pre(batch)
+        feature_acts = sae.encode(batch)
         reconstructions = sae.decode(feature_acts)
 
         per_token_mse = (reconstructions - batch).pow(2).sum(dim=-1)
@@ -93,7 +93,7 @@ def evaluate_reconstruction(sae, loader, device, d_sae, k,
     print(f"  Tokens evaluated : {total_tokens}")
     print(f"  Explained Variance (EV)    : {final_ev:.4f}")
     print(f"  Normalized MSE (NMSE)      : {final_nmse:.4f}")
-    print(f"  L0 (Average Sparsity)      : {final_l0:.1f} (Target K: {k})")
+    print(f"  L0 (Average Sparsity)      : {final_l0:.1f}")
     print(f"  Dead Features              : {dead_features}/{d_sae} ({dead_features/d_sae*100:.2f}%)")
     print("=" * 50)
 
@@ -113,7 +113,7 @@ def make_sae_hook(sae):
     def hook_fn(module, input, output):
         orig_shape = output.shape
         flat = output.reshape(-1, orig_shape[-1])
-        features, _ = sae.encode_with_hidden_pre(flat)
+        features = sae.encode(flat)
         reconstructed = sae.decode(features)
         return reconstructed.reshape(orig_shape)
     return hook_fn
@@ -249,11 +249,12 @@ def evaluate_downstream(sae, args, device):
 # ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="Evaluate SAE: reconstruction + downstream retrieval")
+    parser = argparse.ArgumentParser(description="Evaluate JumpReLU SAE: reconstruction + downstream retrieval")
 
-    # SAE checkpoint
+    # SAE checkpoint (inference directory)
     parser.add_argument("--cache_dir", type=str, default="data/activation_cache_train", help="Activation cache dir")
-    parser.add_argument("--checkpoint_dir", type=str, required=True, help="Path to layer_X directory")
+    parser.add_argument("--inference_dir", type=str, required=True,
+                        help="Path to inference directory (contains cfg.json and sae_weights.safetensors)")
     parser.add_argument("--eval_batch_size", type=int, default=2048)
     parser.add_argument("--eval_batches", type=int, default=500)
 
@@ -269,39 +270,38 @@ def main():
     args = parser.parse_args()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # 1. 读取配置 & 初始化 SAE
-    checkpoint_path = Path(args.checkpoint_dir)
-    with open(checkpoint_path / "sae_config.json", "r") as f:
+    # 1. 读取 inference 配置 & 初始化 JumpReLU SAE
+    inference_path = Path(args.inference_dir)
+    with open(inference_path / "cfg.json", "r") as f:
         sae_cfg_json = json.load(f)
 
-    layer = sae_cfg_json["layer"]
     d_in = sae_cfg_json["d_in"]
     d_sae = sae_cfg_json["d_sae"]
-    k = sae_cfg_json["k"]
 
-    sae_cfg = BatchTopKTrainingSAEConfig(
-        d_in=d_in, d_sae=d_sae, k=k,
-        aux_loss_coefficient=1.0, rescale_acts_by_decoder_norm=True,
-        topk_threshold_lr=0.1, apply_b_dec_to_input=False,
-        normalize_activations="expected_average_only_in", decoder_init_norm=0.01,
-        device=str(device), dtype="float32",
+    sae_cfg = JumpReLUSAEConfig(
+        d_in=d_in,
+        d_sae=d_sae,
+        apply_b_dec_to_input=False,
+        device=str(device),
+        dtype="float32",
     )
-    sae = BatchTopKTrainingSAE(sae_cfg).to(device)
+    sae = JumpReLUSAE(sae_cfg).to(device)
 
-    # 2. 加载权重 (已 fold，scaling_factor 已 bake 进 W_enc/W_dec/b_dec)
-    print(f"Loading weights from {checkpoint_path}...")
-    weights = load_file(str(checkpoint_path / "sae_weights.safetensors"))
+    # 2. 加载 inference 权重 (已 fold，含 threshold)
+    print(f"Loading JumpReLU SAE weights from {inference_path}...")
+    weights = load_file(str(inference_path / "sae_weights.safetensors"))
     sae.W_enc.data = weights["W_enc"].to(device)
     sae.W_dec.data = weights["W_dec"].to(device)
     sae.b_enc.data = weights["b_enc"].to(device)
     sae.b_dec.data = weights["b_dec"].to(device)
-    sae.topk_threshold = weights["topk_threshold"].to(device)
+    sae.threshold.data = weights["threshold"].to(device)
     sae.eval()
 
     # 3. 重建质量评估
+    layer = int(inference_path.parent.name.split("_")[-1])
     loader = ActivationLoader(args.cache_dir, layer)
     recon_results = evaluate_reconstruction(
-        sae, loader, device, d_sae, k,
+        sae, loader, device, d_sae,
         eval_batch_size=args.eval_batch_size,
         eval_batches=args.eval_batches,
     )

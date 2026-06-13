@@ -1,0 +1,43 @@
+Loading data...
+  top1_correct: 3483, top1_wrong: 3483
+  Mapped: correct=3483, wrong=3483
+Loading cached activations from data/activation_cache_dev/layer_12.npz
+  Total activations: torch.Size([30807, 1024])
+Aggregating per-sample activations (mean over tokens)...
+  Good samples: (3483, 1024), Bad samples: (3483, 1024)
+
+Running statistical tests per neuron...
+  Running Mann-Whitney U on 740 candidate neurons (|d|>0.05)...
+Mann-Whitney U:   0%|          | 0/740 [00:00<?, ?it/s]Mann-Whitney U:  15%|█▌        | 112/740 [00:00<00:00, 1111.84it/s]Mann-Whitney U:  30%|███       | 224/740 [00:00<00:00, 1089.19it/s]Mann-Whitney U:  45%|████▌     | 333/740 [00:00<00:00, 1064.94it/s]Mann-Whitney U:  59%|█████▉    | 440/740 [00:00<00:00, 1058.35it/s]Mann-Whitney U:  75%|███████▍  | 553/740 [00:00<00:00, 1081.23it/s]Mann-Whitney U:  90%|████████▉ | 664/740 [00:00<00:00, 1089.92it/s]Mann-Whitney U: 100%|██████████| 740/740 [00:00<00:00, 1074.50it/s]
+  t-test significant (FDR<0.05): 738/1024
+  MW-U significant (FDR<0.05): 713/1024
+
+Running top-k activation frequency analysis...
+
+======================================================================
+好组更高的 Top-10 (t-test 显著):
+  neuron  695: d=0.4887, mean_good=10.5850, mean_bad=5.3200
+  neuron  171: d=0.4806, mean_good=9.3613, mean_bad=5.0239
+  neuron  230: d=0.4495, mean_good=405.8650, mean_bad=334.6563
+  neuron  578: d=0.4254, mean_good=9.1980, mean_bad=4.3923
+  neuron  537: d=0.4153, mean_good=496.8723, mean_bad=419.0507
+  neuron   46: d=0.4080, mean_good=487.1913, mean_bad=414.6566
+  neuron    4: d=0.3785, mean_good=6.6635, mean_bad=2.7936
+  neuron  589: d=0.3751, mean_good=108.4004, mean_bad=88.0942
+  neuron  787: d=0.3700, mean_good=4.9883, mean_bad=1.1970
+  neuron  492: d=0.3640, mean_good=9.8302, mean_bad=5.9592
+坏组更高的 Top-10 (t-test 显著):
+  neuron  679: d=-0.4257, mean_good=-526.2433, mean_bad=-445.2393
+  neuron  271: d=-0.4230, mean_good=-487.4299, mean_bad=-413.6999
+  neuron  834: d=-0.4226, mean_good=-491.9198, mean_bad=-415.5609
+  neuron  526: d=-0.4206, mean_good=-353.4859, mean_bad=-295.7755
+  neuron   29: d=-0.4195, mean_good=-486.3849, mean_bad=-411.7578
+  neuron  278: d=-0.4119, mean_good=-486.7522, mean_bad=-413.1281
+  neuron  314: d=-0.4085, mean_good=-4.5153, mean_bad=-0.1800
+  neuron  499: d=-0.4083, mean_good=-183.8533, mean_bad=-151.4716
+  neuron  657: d=-0.4069, mean_good=-10.3683, mean_bad=-5.9991
+  neuron  728: d=-0.3886, mean_good=-8.5341, mean_bad=-4.4401
+======================================================================
+
+Report saved to sae/neuron_analysis_report.md
+Raw data saved to sae/neuron_analysis_data.npz

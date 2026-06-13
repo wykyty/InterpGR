@@ -95,7 +95,7 @@ def train(args):
 
     # Optimizer & LR Scheduler (引入余弦退火衰减)
     optimizer = torch.optim.Adam(sae.parameters(), lr=args.lr, betas=(0.9, 0.999))
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.total_steps, eta_min=1e-6)
+    # scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.total_steps, eta_min=1e-6)
     
     # 增加学习率预热
     scheduler = get_cosine_schedule_with_warmup(
