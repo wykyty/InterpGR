@@ -211,7 +211,7 @@ def main():
     parser.add_argument("--d_sae", type=int, default=16384)
     parser.add_argument("--k", type=float, default=100.0)
     parser.add_argument("--total_steps", type=int, default=30000)
-    parser.add_argument("--batch_size", type=int, default=16384)  # 单卡大 Batch 模拟 8 卡总和
+    parser.add_argument("--batch_size", type=int, default=32768)  # 单卡大 Batch 模拟 8 卡总和
     parser.add_argument("--lr", type=float, default=3e-4)        # 对应大 Batch 的标准 LR
     parser.add_argument("--log_every", type=int, default=100)
     parser.add_argument("--n_batches_for_norm", type=int, default=50)

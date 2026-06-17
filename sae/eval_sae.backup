@@ -21,8 +21,8 @@ from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 # SAE Reconstruction Evaluation
 # ---------------------------------------------------------------------------
 
-class ActivationDataset(Dataset):
-    """激活值数据集，用于DataLoader"""
+class ActivationLoader:
+    """顺序读取缓存激活值，用于评估。"""
     def __init__(self, cache_dir: str, layer: int):
         cache_path = Path(cache_dir) / f"layer_{layer}.safetensors"
         print(f"Loading cached activations from {cache_path}...")
@@ -30,114 +30,89 @@ class ActivationDataset(Dataset):
         self.activations = data["activations"]
         self.total_tokens = self.activations.shape[0]
         self.d_in = self.activations.shape[1]
+        self.current_ptr = 0
+        self.indices = torch.arange(self.total_tokens)
         print(f"Loaded {self.total_tokens} tokens, d_in={self.d_in}")
+
+    def sample(self, batch_size: int, device: torch.device) -> torch.Tensor | None:
+        if self.current_ptr >= self.total_tokens:
+            return None
+        end = min(self.current_ptr + batch_size, self.total_tokens)
+        batch_indices = self.indices[self.current_ptr : end]
+        self.current_ptr = end
+        return self.activations[batch_indices].to(device)
+
+
+class ActivationDataset(Dataset):
+    def __init__(self, cache_dir: str, layer: int):
+        cache_path = Path(cache_dir) / f"layer_{layer}.safetensors"
+        data = load_file(str(cache_path))
+        self.activations = data["activations"]
+        self.total_tokens = self.activations.shape[0]
+        self.d_in = self.activations.shape[1]
     
     def __len__(self):
         return self.total_tokens
     
     def __getitem__(self, index):
         return self.activations[index]
-
+        
 
 @torch.no_grad()
-def evaluate_reconstruction(sae, dataloader, device, d_sae, k,
-                            eval_batches: int = None) -> dict:
-    """
-    流式评估 SAE 重建质量，返回指标字典。
-    
-    Args:
-        sae: SAE模型
-        dataloader: DataLoader，每次返回 [batch_size, d_in]
-        device: 设备
-        d_sae: SAE隐空间维度
-        k: TopK值
-        eval_batches: 评估的batch数，None表示使用全部数据
-    """
+def evaluate_reconstruction(sae, loader, device, d_sae, k,
+                            eval_batch_size=2048, eval_batches=500) -> dict:
+    """流式评估 SAE 重建质量，返回指标字典。"""
     sae.eval()
-    
-    # ========== 第一阶段：计算全局均值 ==========
-    print("Computing global mean...")
-    global_mean = torch.zeros(dataloader.dataset.d_in, device=device)
-    total_tokens_mean = 0
-    
-    # 为了计算均值，我们使用不shuffle的dataloader
-    # 但如果原dataloader是shuffle的，也没关系，均值计算不受顺序影响
-    for batch_idx, batch in enumerate(tqdm(dataloader, desc="Computing mean")):
-        if eval_batches and batch_idx >= eval_batches:
-            break
-        batch = batch.to(device)
-        global_mean += batch.sum(dim=0)
-        total_tokens_mean += batch.shape[0]
-    
-    global_mean /= total_tokens_mean
-    print(f"Global mean computed on {total_tokens_mean} tokens")
-    
-    # ========== 第二阶段：正式评估 ==========
-    # 重新创建DataLoader确保从头开始
-    # 注意：如果原dataloader是shuffle的，这里会再次shuffle，但评估结果不受影响
-    print("Evaluating reconstruction...")
-    
     total_mse = 0.0
     total_variance = 0.0
+    total_nmse = 0.0
     total_l0 = 0.0
     total_tokens = 0
     feature_activated_counts = torch.zeros(d_sae, device=device)
-    
-    for batch_idx, batch in enumerate(tqdm(dataloader, desc="Evaluating")):
-        if eval_batches and batch_idx >= eval_batches:
+
+    for _ in tqdm(range(eval_batches), desc="Evaluating reconstruction"):
+        batch = loader.sample(eval_batch_size, device)
+        if batch is None:
             break
-        
-        batch = batch.to(device)
-        
-        # SAE前向传播
+
         feature_acts, _ = sae.encode_with_hidden_pre(batch)
         reconstructions = sae.decode(feature_acts)
-        
-        # 计算每个token的MSE (在特征维度上求和)
+
         per_token_mse = (reconstructions - batch).pow(2).sum(dim=-1)
+        per_token_var = (batch - batch.mean(0)).pow(2).sum(dim=-1)
+
         total_mse += per_token_mse.sum().item()
-        
-        # 计算方差：使用全局均值（修正！）
-        per_token_var = (batch - global_mean).pow(2).sum(dim=-1)
         total_variance += per_token_var.sum().item()
-        
-        # 稀疏度统计
+        total_nmse += (per_token_mse / (batch.pow(2).sum(dim=-1) + 1e-8)).sum().item()
+
         active_mask = feature_acts > 0
         total_l0 += active_mask.sum(-1).float().sum().item()
         feature_activated_counts += active_mask.float().sum(dim=0)
         total_tokens += batch.shape[0]
-    
+
     if total_tokens == 0:
         print("  No tokens evaluated.")
         return {}
-    
-    # ========== 计算指标 ==========
-    # EV和NMSE使用相同的分母（全局方差），保证 EV + NMSE ≈ 1
+
     final_ev = 1 - (total_mse / (total_variance + 1e-8))
-    final_nmse = total_mse / (total_variance + 1e-8)
+    final_nmse = total_nmse / total_tokens
     final_l0 = total_l0 / total_tokens
     dead_features = (feature_activated_counts == 0).sum().item()
-    
+
     results = {
-        "tokens": total_tokens,
-        "ev": final_ev,
-        "nmse": final_nmse,
-        "l0": final_l0,
-        "dead": dead_features,
-        "dead_ratio": dead_features / d_sae,
+        "tokens": total_tokens, "ev": final_ev, "nmse": final_nmse,
+        "l0": final_l0, "dead": dead_features, "dead_ratio": dead_features / d_sae,
     }
-    
-    # 打印结果
+
     print("\n" + "=" * 50)
     print("[RECONSTRUCTION EVALUATION]")
     print(f"  Tokens evaluated : {total_tokens}")
     print(f"  Explained Variance (EV)    : {final_ev:.4f}")
-    print(f"  Normalized MSE (NMSE)      : {final_nmse:.4f}  (Expected: ~{1-final_ev:.4f})")
-    print(f"  EV + NMSE                  : {final_ev + final_nmse:.6f}  (Should be ~1.0)")
+    print(f"  Normalized MSE (NMSE)      : {final_nmse:.4f}")
     print(f"  L0 (Average Sparsity)      : {final_l0:.1f} (Target K: {k})")
     print(f"  Dead Features              : {dead_features}/{d_sae} ({dead_features/d_sae*100:.2f}%)")
     print("=" * 50)
-    
+
     return results
 
 
@@ -146,13 +121,16 @@ def evaluate_reconstruction(sae, dataloader, device, d_sae, k,
 # ---------------------------------------------------------------------------
 
 def make_sae_hook(sae):
-    """创建 forward hook：用 SAE 重建替换 decoder MLP 输出。"""
+    """创建 forward hook：用 SAE 重建替换 decoder MLP 输出。
+
+    权重已 fold，SAE 直接接受 raw activation，无需 scaling_factor。
+    对应 TransformerLens 的 decoder.{L}.hook_mlp_out。
+    """
     def hook_fn(module, input, output):
         orig_shape = output.shape
         flat = output.reshape(-1, orig_shape[-1])
-        with torch.no_grad():  # 避免梯度计算，节省内存
-            features, _ = sae.encode_with_hidden_pre(flat)
-            reconstructed = sae.decode(features)
+        features, _ = sae.encode_with_hidden_pre(flat)
+        reconstructed = sae.decode(features)
         return reconstructed.reshape(orig_shape)
     return hook_fn
 
@@ -180,7 +158,7 @@ def run_constrained_beam_search(model, data_loader, tree, top_k=100, max_length=
 
 
 def compute_retrieval_metrics(preds, raw_dev_data, doc_to_tuple, top_k=100):
-    """计算 Hits@1/10/100 和 MRR。"""
+    """计算 Hits@1/10/100 和 MRR，与 test_semantic3 逻辑一致。"""
     hit1, hit10, hit100, mrr_list = [], [], [], []
     for data_ptr, pred_list in enumerate(preds):
         _, true_doc_id = raw_dev_data[data_ptr]
@@ -218,8 +196,7 @@ def evaluate_downstream(sae, args, device):
     model = AutoModelForSeq2SeqLM.from_pretrained(args.model_name)
     tokenizer.add_tokens([f'${i}$' for i in range(num_of_new_tokens)])
     model.resize_token_embeddings(len(tokenizer))
-    # 使用strict=False避免token embedding不匹配的问题
-    model.load_state_dict(torch.load(args.genret_ckpt, map_location='cpu'), strict=False)
+    model.load_state_dict(torch.load(args.genret_ckpt, map_location='cpu'))
     model = model.cuda().eval()
 
     # 2. 构建语义 ID 映射和 Tree
@@ -232,10 +209,7 @@ def evaluate_downstream(sae, args, device):
         token_ids = [tokenizer.convert_tokens_to_ids(f'${v}$') for v in z]
         doc_to_tuple[doc_idx] = tuple(token_ids)
 
-    # 使用tokenizer的实际特殊token ID
-    pad_id = tokenizer.pad_token_id or 0
-    eos_id = tokenizer.eos_token_id or 1
-    corpus_token_ids = [[pad_id] + list(doc_to_tuple[idx]) + [eos_id] for idx in range(len(corpus_strs))]
+    corpus_token_ids = [[0] + list(doc_to_tuple[idx]) + [1] for idx in range(len(corpus_strs))]
     tree = Tree()
     tree.set_all(corpus_token_ids)
 
@@ -297,9 +271,7 @@ def main():
     parser.add_argument("--cache_dir", type=str, default="data/activation_cache_train", help="Activation cache dir")
     parser.add_argument("--checkpoint_dir", type=str, required=True, help="Path to layer_X directory")
     parser.add_argument("--eval_batch_size", type=int, default=2048)
-    parser.add_argument("--eval_batches", type=int, default=None, help="Number of batches to evaluate (None = all)")
-    parser.add_argument("--num_workers", type=int, default=8, help="DataLoader workers")
-    parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
+    parser.add_argument("--eval_batches", type=int, default=500)
 
     # Downstream retrieval (optional)
     parser.add_argument("--downstream", action="store_true", help="Run downstream retrieval evaluation")
@@ -311,12 +283,7 @@ def main():
     parser.add_argument("--hook_layer", type=int, default=12, help="Decoder layer to hook")
 
     args = parser.parse_args()
-    
-    # 设置随机种子
-    torch.manual_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(args.seed)
 
     # 1. 读取配置 & 初始化 SAE
     checkpoint_path = Path(args.checkpoint_dir)
@@ -347,28 +314,12 @@ def main():
     sae.topk_threshold = weights["topk_threshold"].to(device)
     sae.eval()
 
-    # 3. 重建质量评估（使用DataLoader）
-    print("\n" + "=" * 50)
-    print("STARTING RECONSTRUCTION EVALUATION")
-    print("=" * 50)
-    
+    # 3. 重建质量评估
     dataset = ActivationDataset(cache_dir=args.cache_dir, layer=layer)
-    dataloader = DataLoader(
-        dataset,
-        batch_size=args.eval_batch_size,
-        shuffle=True,  # 随机采样避免顺序偏差
-        num_workers=args.num_workers,
-        pin_memory=True if torch.cuda.is_available() else False,
-        drop_last=False,
-        generator=torch.Generator().manual_seed(args.seed)  # 固定shuffle顺序
-    )
-    
+    dataloader = DataLoader(dataset, batch_size=args.eval_batch_size, shuffle=True, num_workers=8)
     recon_results = evaluate_reconstruction(
-        sae,
-        dataloader,
-        device,
-        d_sae,
-        k,
+        sae, dataloader, device, d_sae, k,
+        eval_batch_size=args.eval_batch_size,
         eval_batches=args.eval_batches,
     )
 
@@ -377,14 +328,9 @@ def main():
         if not args.genret_ckpt:
             print("Error: --downstream requires --genret_ckpt")
             sys.exit(1)
-        print("\n" + "=" * 50)
-        print("STARTING DOWNSTREAM EVALUATION")
-        print("=" * 50)
         downstream_results = evaluate_downstream(sae, args, device)
 
-    print("\n" + "=" * 50)
-    print("EVALUATION COMPLETE!")
-    print("=" * 50)
+    print("\nDone!")
 
 
 if __name__ == "__main__":

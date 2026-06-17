@@ -1,0 +1,12 @@
+Loading data...
+  Activations: torch.Size([30807, 1024])
+Loading SAE from out/sae_train_8x/layer_12...
+  d_in=1024, d_sae=8192, k=100
+Encoding through SAE...
+SAE encode:   0%|          | 0/8 [00:00<?, ?it/s]SAE encode:  12%|█▎        | 1/8 [00:00<00:01,  4.45it/s]SAE encode:  25%|██▌       | 2/8 [00:00<00:00,  6.14it/s]SAE encode:  38%|███▊      | 3/8 [00:00<00:00,  6.99it/s]SAE encode:  50%|█████     | 4/8 [00:00<00:00,  7.48it/s]SAE encode:  62%|██████▎   | 5/8 [00:00<00:00,  7.77it/s]SAE encode:  75%|███████▌  | 6/8 [00:00<00:00,  7.97it/s]SAE encode:  88%|████████▊ | 7/8 [00:00<00:00,  8.09it/s]SAE encode: 100%|██████████| 8/8 [00:01<00:00,  7.97it/s]
+  Features shape: (30807, 8192)
+Aggregating per-sample (7830 samples)...
+  Features with >5% activation rate: 2455
+  Selected 25 features for inspection
+
+Report saved to sae/feature_inspection.md

@@ -1098,12 +1098,162 @@ def test_semantic3(eval_all_checkpoints=False):  # 可以跑通，topk 扩展到
 
     print("\nDone.")
 
+def test_semantic3_per_position(eval_all_checkpoints=False):
+    """评估微调后的 t5-large 在 dev 数据集上每一位 docid 的预测准确率"""
+    os.environ['TOKENIZERS_PARALLELISM'] = 'false'
+    batch_size = 16
+    save_path = 'out/dsi-semantic-bert'
+    num_of_new_tokens = 30
+    top_k = 1  # 逐位准确率只需看 top-1 预测即可
+
+    model = AutoModelForSeq2SeqLM.from_pretrained('google-t5/t5-large')
+    tokenizer = AutoTokenizer.from_pretrained('google-t5/t5-large')
+    tokenizer.add_tokens([f'${i}$' for i in range(num_of_new_tokens)])
+    model.resize_token_embeddings(len(tokenizer))
+    model = model.cuda()
+    model.eval()
+
+    raw_dev_data = json.load(open('dataset/nq320k/dev.json'))
+
+    semantic_ids = json.load(open('dataset/nq320k_id/id.semantic.bert.json'))
+    corpus_strs = [''.join([f'${i}$' for i in z]) for z in semantic_ids]
+
+    # 建立从 "纯Token ID元组" 到 "文档索引" 的双向映射
+    tuple_to_docs = defaultdict(list)
+    doc_to_tuple = {}
+
+    for doc_idx, z in enumerate(semantic_ids):
+        token_ids = []
+        for token_val in z:
+            t_id = tokenizer.convert_tokens_to_ids(f'${token_val}$')
+            token_ids.append(t_id)
+
+        token_tuple = tuple(token_ids)
+        tuple_to_docs[token_tuple].append(doc_idx)
+        doc_to_tuple[doc_idx] = token_tuple
+
+    # 构建受限解码树
+    corpus_token_ids = [[0] + list(doc_to_tuple[idx]) + [1] for idx in range(len(corpus_strs))]
+    tree = Tree()
+    tree.set_all(corpus_token_ids)
+
+    dataset = NewNQDataset(data=raw_dev_data, corpus=corpus_strs, tokenizer=tokenizer, max_len=32)
+    data_loader = torch.utils.data.DataLoader(
+        dataset, collate_fn=dataset.collate_fn, batch_size=batch_size,
+        shuffle=False, num_workers=4,
+    )
+
+    all_ckpts = sorted([int(f.split('.')[0]) for f in os.listdir(save_path) if f.endswith('.pt') and f.split('.')[0].isdigit()])
+    if not all_ckpts:
+        return
+    checkpoints = [all_ckpts[-1]]  # 默认只评估最后一个 checkpoint
+
+    # 获取 docid 的长度（所有 docid 长度应一致）
+    # 检查所有 docid 的长度分布
+    id_lengths = [len(z) for z in semantic_ids]
+    from collections import Counter
+    length_dist = Counter(id_lengths)
+    print(f"DocID 长度分布: {dict(length_dist)}")
+    id_len = max(id_lengths)
+    print(f"最大 DocID 长度: {id_len}")
+
+    for epoch in checkpoints:
+        ckpt_path = f'{save_path}/{epoch}.pt'
+        print(f'\n=== Epoch {epoch} ({ckpt_path}) ===')
+        model.load_state_dict(torch.load(ckpt_path, map_location='cuda'))
+
+        # 每一位的匹配计数
+        position_correct = [0] * id_len
+        position_total = [0] * id_len
+        # 整体完全匹配（所有位都对）
+        full_match_correct = 0
+        total_samples = 0
+
+        data_ptr = 0
+
+        with torch.no_grad():
+            for batch in tqdm(data_loader, total=len(data_loader), desc=f"Epoch {epoch}"):
+                batch_size_actual = batch['input_ids'].size(0)
+                batch = {k: v.cuda() for k, v in batch.items() if v is not None}
+
+                output = model.generate(
+                    input_ids=batch['input_ids'],
+                    attention_mask=batch['attention_mask'],
+                    max_length=15,
+                    num_beams=top_k,
+                    num_return_sequences=top_k,
+                    prefix_allowed_tokens_fn=tree,
+                )
+
+                output = output.cpu().tolist()
+
+                # 提取模型生成的纯有效新 Token 序列（过滤掉 pad/eos/unk）
+                cleaned_preds = []
+                for seq in output:
+                    valid_tokens = [t for t in seq if t not in [0, 1, 2]]
+                    cleaned_preds.append(tuple(valid_tokens))
+
+                for b_idx in range(batch_size_actual):
+                    pred_tuple = cleaned_preds[b_idx]
+
+                    _, true_doc_id = raw_dev_data[data_ptr]
+                    while isinstance(true_doc_id, list):
+                        true_doc_id = true_doc_id[0]
+
+                    true_token_tuple = doc_to_tuple.get(true_doc_id, None)
+
+                    if true_token_tuple is not None:
+                        # 逐位比较
+                        all_match = True
+                        for pos in range(id_len):
+                            position_total[pos] += 1
+                            if pos < len(pred_tuple) and pos < len(true_token_tuple) and pred_tuple[pos] == true_token_tuple[pos]:
+                                position_correct[pos] += 1
+                            else:
+                                all_match = False
+
+                        # 预测长度也需要完全一致才算整体匹配
+                        if len(pred_tuple) != len(true_token_tuple):
+                            all_match = False
+                        if all_match:
+                            full_match_correct += 1
+
+                    total_samples += 1
+                    data_ptr += 1
+
+        # ─── 打印逐位准确率报表 ───
+        print(f"\n================📊 EPOCH {epoch} PER-POSITION ACCURACY ================")
+        print(f"总样本数: {total_samples}")
+        print(f"")
+        for pos in range(id_len):
+            acc = position_correct[pos] / position_total[pos] if position_total[pos] > 0 else 0.0
+            print(f"  Position {pos}: {position_correct[pos]}/{position_total[pos]} = {acc:.4f}")
+        print(f"")
+        full_match_acc = full_match_correct / total_samples if total_samples > 0 else 0.0
+        print(f"  完全匹配 (所有位都正确): {full_match_correct}/{total_samples} = {full_match_acc:.4f}")
+        print(f"=====================================================================")
+
+        try:
+            import wandb as _w
+            if _w.run is not None:
+                log_dict = {'eval/epoch': epoch, 'eval/full_match': full_match_acc}
+                for pos in range(id_len):
+                    acc = position_correct[pos] / position_total[pos] if position_total[pos] > 0 else 0.0
+                    log_dict[f'eval/pos_{pos}_acc'] = acc
+                _w.log(log_dict)
+        except:
+            pass
+
+    print("\nDone.")
+
+
 if __name__ == '__main__':
     # train()
     # test_atomic()
 
-    train_semantic()
+    # train_semantic()
     # test_semantic3()
+    test_semantic3_per_position()
     
     # tmp()
     # exit()

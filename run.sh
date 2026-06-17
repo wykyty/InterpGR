@@ -1,96 +1,126 @@
 #!/bin/bash
-# cd "$(dirname "$0")"
-# mkdir -p log
-# uv run torchrun --nproc_per_node=8 baseline.py > log/train_semantic_bert_3.log 2>&1 &
-# echo "PID: $!, log: log/train_semantic_bert_3.log"
 
-CUDA_VISIBLE_DEVICES=0 uv run python sae/train_sae.py \
-    --cache_dir data/activation_cache \
-    --lr 4e-4 \
-    --d_sae 4096 \
-    --total_steps 30000 \
-    --batch_size 32768 \
-    --layer 14 \
-    --save_dir out/sae_train_4x > log/sae_train_4x/layer14.log 2>&1 &
+# 如果任何命令失败，立即停止脚本
+# set -e
 
-CUDA_VISIBLE_DEVICES=1 uv run python sae/train_sae.py \
-    --cache_dir data/activation_cache \
-    --lr 4e-4 \
-    --d_sae 8192 \
-    --total_steps 30000 \
-    --batch_size 32768 \
-    --layer 14 \
-    --save_dir out/sae_train_8x > log/sae_train_8x/layer14.log 2>&1 &
+echo "=========================================="
+echo " 阶段 1: 缓存激活"
+echo "=========================================="
 
-CUDA_VISIBLE_DEVICES=2 uv run python sae/train_sae.py \
-    --cache_dir data/activation_cache \
-    --lr 4e-4 \
-    --d_sae 4096 \
-    --total_steps 30000 \
-    --batch_size 32768 \
-    --layer 15 \
-    --save_dir out/sae_train_4x > log/sae_train_4x/layer15.log 2>&1 &
+layers=(10 11 13 19 21 22 23)
+mkdir -p log/cache
 
-CUDA_VISIBLE_DEVICES=3 uv run python sae/train_sae.py \
-    --cache_dir data/activation_cache \
-    --lr 4e-4 \
-    --d_sae 8192 \
-    --total_steps 30000 \
-    --batch_size 32768 \
-    --layer 15 \
-    --save_dir out/sae_train_8x > log/sae_train_8x/layer15.log 2>&1 &
+gpu_id=1
+for layer in "${layers[@]}"; do
+    echo "正在启动 GPU $gpu_id 缓存 Layer $layer ..."
+    
+    CUDA_VISIBLE_DEVICES=$gpu_id uv run python sae/cache_activations.py \
+        --checkpoint out/dsi-semantic-bert/99.pt \
+        --data_path dataset/nq320k/train.json \
+        --cache_dir data/activation_cache_train \
+        --n_gpus 1 \
+        --layer $layer > "log/cache/layer${layer}.log" 2>&1 &
 
-CUDA_VISIBLE_DEVICES=4 uv run python sae/train_sae.py \
-    --cache_dir data/activation_cache \
-    --lr 4e-4 \
-    --d_sae 4096 \
-    --total_steps 30000 \
-    --batch_size 32768 \
-    --layer 16 \
-    --save_dir out/sae_train_4x > log/sae_train_4x/layer16.log 2>&1 &
+    ((gpu_id++))    
+done
 
-CUDA_VISIBLE_DEVICES=5 uv run python sae/train_sae.py \
-    --cache_dir data/activation_cache \
-    --lr 4e-4 \
-    --d_sae 8192 \
-    --total_steps 30000 \
-    --batch_size 32768 \
-    --layer 16 \
-    --save_dir out/sae_train_8x > log/sae_train_8x/layer16.log 2>&1 &
+wait
+echo "✅ 缓存完毕"
 
-CUDA_VISIBLE_DEVICES=6 uv run python sae/train_sae.py \
-    --cache_dir data/activation_cache \
-    --lr 4e-4 \
-    --d_sae 4096 \
-    --total_steps 30000 \
-    --batch_size 32768 \
-    --layer 17 \
-    --save_dir out/sae_train_4x > log/sae_train_4x/layer17.log 2>&1 &
+echo "=========================================="
+echo " 阶段 2: 训练 4x"
+echo "=========================================="
 
-CUDA_VISIBLE_DEVICES=7 uv run python sae/train_sae.py \
-    --cache_dir data/activation_cache \
-    --lr 4e-4 \
-    --d_sae 8192 \
-    --total_steps 30000 \
-    --batch_size 32768 \
-    --layer 17 \
-    --save_dir out/sae_train_8x > log/sae_train_8x/layer17.log 2>&1 &
+mkdir -p log/sae_train_4x
 
-CUDA_VISIBLE_DEVICES=6 uv run python sae/train_sae.py \
-    --cache_dir data/activation_cache \
-    --lr 4e-4 \
-    --d_sae 4096 \
-    --total_steps 30000 \
-    --batch_size 32768 \
-    --layer 18 \
-    --save_dir out/sae_train_4x > log/sae_train_4x/layer17.log 2>&1 &
+gpu_id=1
+for layer in "${layers[@]}"; do
+    echo "正在启动 GPU $gpu_id 训练 Layer $layer ..."
 
-CUDA_VISIBLE_DEVICES=7 uv run python sae/train_sae.py \
-    --cache_dir data/activation_cache \
-    --lr 4e-4 \
-    --d_sae 8192 \
-    --total_steps 30000 \
-    --batch_size 32768 \
-    --layer 18 \
-    --save_dir out/sae_train_8x > log/sae_train_8x/layer17.log 2>&1 &
+    CUDA_VISIBLE_DEVICES=$gpu_id uv run python sae/train_sae.py \
+        --cache_dir data/activation_cache_train \
+        --lr 4e-4 \
+        --d_sae 4096 \
+        --batch_size 32768 \
+        --layer $layer \
+        --save_dir out/sae_train_4x > "log/sae_train_4x/layer${layer}.log" 2>&1 &
 
+    ((gpu_id++))
+done
+
+wait
+echo "✅ 4x训练完毕"
+
+echo "=========================================="
+echo " 阶段 3: 训练 8x"
+echo "=========================================="
+
+mkdir -p log/sae_train_8x
+
+gpu_id=1
+for layer in "${layers[@]}"; do
+    echo "正在启动 GPU $gpu_id 训练 Layer $layer ..."
+
+    CUDA_VISIBLE_DEVICES=$gpu_id uv run python sae/train_sae.py \
+        --cache_dir data/activation_cache_train \
+        --lr 4e-4 \
+        --d_sae 8192 \
+        --batch_size 32768 \
+        --layer $layer \
+        --save_dir out/sae_train_8x > "log/sae_train_8x/layer${layer}.log" 2>&1 &
+
+    ((gpu_id++))
+done
+
+wait
+echo "✅ 8x训练完毕"
+
+echo "=========================================="
+echo " 阶段 4: 评估 4x"
+echo "=========================================="
+
+mkdir -p log/sae_eval_4x
+
+gpu_id=1
+for layer in "${layers[@]}"; do
+    echo "正在启动 GPU $gpu_id 评估 Layer $layer ..."
+
+    CUDA_VISIBLE_DEVICES=$gpu_id uv run python sae/eval_sae.py \
+        --cache_dir data/activation_cache_train \
+        --checkpoint_dir out/sae_train_4x/layer_${layer} \
+        --downstream \
+        --genret_ckpt out/dsi-semantic-bert/99.pt \
+        --hook_layer $layer > "log/sae_eval_4x/layer_${layer}.log" 2>&1 &
+
+    ((gpu_id++))
+done
+
+wait
+echo "✅ 4x评估完毕"
+
+echo "=========================================="
+echo " 阶段 5: 评估 8x"
+echo "=========================================="
+
+mkdir -p log/sae_eval_8x
+
+gpu_id=1
+for layer in "${layers[@]}"; do
+    echo "正在启动 GPU $gpu_id 评估 Layer $layer ..."
+
+    CUDA_VISIBLE_DEVICES=$gpu_id uv run python sae/eval_sae.py \
+        --cache_dir data/activation_cache_train \
+        --checkpoint_dir out/sae_train_8x/layer_${layer} \
+        --downstream \
+        --genret_ckpt out/dsi-semantic-bert/99.pt \
+        --hook_layer $layer > "log/sae_eval_8x/layer_${layer}.log" 2>&1 &
+
+    ((gpu_id++))
+done
+
+wait
+echo "✅ 8x评估完毕"
+
+echo "=========================================="
+echo "🎉 所有任务完成！"
+echo "=========================================="

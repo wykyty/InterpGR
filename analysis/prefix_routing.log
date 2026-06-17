@@ -1,0 +1,42 @@
+Loading data...
+  Found 30 unique first-level prefixes
+    prefix  0: 248 samples
+    prefix  1: 188 samples
+    prefix  2: 248 samples
+    prefix  3: 323 samples
+    prefix  4: 412 samples
+    prefix  5: 239 samples
+    prefix  6: 259 samples
+    prefix  7: 233 samples
+    prefix  8: 147 samples
+    prefix  9: 155 samples
+    prefix 10: 286 samples
+    prefix 11: 430 samples
+    prefix 12: 184 samples
+    prefix 13: 173 samples
+    prefix 14: 513 samples
+    prefix 15: 164 samples
+    prefix 16: 564 samples
+    prefix 17: 149 samples
+    prefix 18: 271 samples
+    prefix 19: 243 samples
+    prefix 20: 161 samples
+    prefix 21: 217 samples
+    prefix 22: 185 samples
+    prefix 23: 234 samples
+    prefix 24: 183 samples
+    prefix 25: 174 samples
+    prefix 26: 420 samples
+    prefix 27: 402 samples
+    prefix 28: 276 samples
+    prefix 29: 149 samples
+Loading SAE and encoding...
+SAE encode:   0%|          | 0/8 [00:00<?, ?it/s]SAE encode:  12%|█▎        | 1/8 [00:00<00:03,  2.07it/s]SAE encode:  25%|██▌       | 2/8 [00:00<00:01,  3.36it/s]SAE encode:  38%|███▊      | 3/8 [00:00<00:01,  4.25it/s]SAE encode:  50%|█████     | 4/8 [00:00<00:00,  5.19it/s]SAE encode:  62%|██████▎   | 5/8 [00:01<00:00,  6.03it/s]SAE encode:  75%|███████▌  | 6/8 [00:01<00:00,  6.89it/s]SAE encode:  88%|████████▊ | 7/8 [00:01<00:00,  7.08it/s]SAE encode: 100%|██████████| 8/8 [00:01<00:00,  5.80it/s]
+Aggregating per-sample (7830 samples, d_sae=8192)...
+Computing per-prefix feature means...
+Computing z-scores...
+Identifying prefix routing features...
+Generating report...
+
+Report saved to analysis/prefix_routing_report.md
+Raw data saved to analysis/prefix_routing_data.npz

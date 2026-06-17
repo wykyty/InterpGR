@@ -1,0 +1,14 @@
+Loading data...
+Loading SAE and encoding...
+SAE encode:   0%|          | 0/8 [00:00<?, ?it/s]SAE encode:  12%|█▎        | 1/8 [00:00<00:02,  2.71it/s]SAE encode:  25%|██▌       | 2/8 [00:00<00:01,  4.34it/s]SAE encode:  38%|███▊      | 3/8 [00:00<00:00,  5.79it/s]SAE encode:  50%|█████     | 4/8 [00:00<00:00,  6.50it/s]SAE encode:  62%|██████▎   | 5/8 [00:00<00:00,  6.57it/s]SAE encode:  75%|███████▌  | 6/8 [00:01<00:00,  6.78it/s]SAE encode:  88%|████████▊ | 7/8 [00:01<00:00,  7.48it/s]SAE encode: 100%|██████████| 8/8 [00:01<00:00,  6.64it/s]
+  Success samples: 3483, Failure samples: 3483
+Computing per-feature statistics...
+Filtering significant features...
+  Success features (d>0.3, rate_diff>5%): 22
+  Failure features (d<-0.3, rate_diff<-5%): 0
+  Success features (d>0.5, rate_diff>10%): 3
+  Failure features (d<-0.5, rate_diff<-10%): 0
+Generating report...
+
+Report saved to analysis/failure_diagnosis_report.md
+Raw data saved to analysis/failure_diagnosis_data.npz
