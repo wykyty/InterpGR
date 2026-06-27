@@ -74,15 +74,6 @@ def build_comparison_data():
     model.load_state_dict(torch.load(ckpt_path, map_location='cuda'))
 
     # ── 5. 推理 + 收集指标 ──
-    # 语义 ID tuple → 字符串 的缓存
-    tuple_to_str_cache = {}
-    def tuple_to_id_str(t):
-        if t not in tuple_to_str_cache:
-            tuple_to_str_cache[t] = ''.join(
-                [tokenizer.decode([tid], skip_special_tokens=False).replace('$', '').strip() for tid in t]
-            )
-        return tuple_to_str_cache[t]
-
     results = []
     data_ptr = 0
 
@@ -100,15 +91,18 @@ def build_comparison_data():
                 prefix_allowed_tokens_fn=tree,
             )
 
-            # 解码并分组
-            decoded = tokenizer.batch_decode(output, skip_special_tokens=True)
-            decoded = [x.replace('$', '').strip() for x in decoded]
+            # 解码并分组（逐 token 解码，跳过特殊 token，用 '.' 分隔）
+            output_ids = output.cpu().tolist()
+            decoded = []
+            for seq in output_ids:
+                parts = [tokenizer.decode([tid], skip_special_tokens=False).replace('$', '').strip()
+                         for tid in seq if tid not in (0, 1, 2)]
+                decoded.append('.'.join(p for p in parts if p))
             preds_str = [decoded[i:i + top_k] for i in range(0, len(decoded), top_k)]
 
             # 提取 token tuple
-            output_list = output.cpu().tolist()
             cleaned_preds = []
-            for seq in output_list:
+            for seq in output_ids:
                 valid_tokens = [t for t in seq if t not in [0, 1, 2]]
                 cleaned_preds.append(tuple(valid_tokens))
             preds_tuple = [cleaned_preds[i:i + top_k] for i in range(0, len(cleaned_preds), top_k)]

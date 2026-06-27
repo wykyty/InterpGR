@@ -20,10 +20,10 @@ done
 
 CUDA_VISIBLE_DEVICES=1 uv run python sae/cache_activations.py \
         --checkpoint out/dsi-semantic-bert/99.pt \
-        --data_path dataset/nq320k/train.json \
-        --cache_dir data/activation_cache_train \
+        --data_path dataset/nq320k/dev.json \
+        --cache_dir data/activation_cache_dev \
         --n_gpus 1 \
-        --layer 3 > log/cache/layer3.log 2>&1 &
+        --layer 12 > log/layer12.log 2>&1 &
 
 CUDA_VISIBLE_DEVICES=2 uv run python sae/cache_activations.py \
         --checkpoint out/dsi-semantic-bert/99.pt \
