@@ -24,3 +24,6 @@ out
 
 # log
 log/
+
+prompt.txt
+.env
