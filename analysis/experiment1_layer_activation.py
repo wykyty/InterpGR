@@ -16,8 +16,8 @@ number of active latents. The BatchTopK training SAE can force the average
 active count toward k and is therefore less suitable for this comparison.
 
 Example:
-    uv run python sae/analysis.py \
-        --cache-dir data/activation_cache_dev \
+    uv run python analysis/experiment1_layer_activation.py \
+        --cache-dir data/activation_cache \
         --checkpoint-root out/sae_train_8x \
         --output-dir results/layer_activation_statistics
 """
@@ -28,7 +28,7 @@ import argparse
 import csv
 import gc
 import json
-import re
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -36,120 +36,16 @@ import torch
 from safetensors.torch import load_file
 from tqdm.auto import tqdm
 
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
-LAYER_CACHE_PATTERN = re.compile(r"layer_(\d+)\.safetensors$")
-LAYER_DIR_PATTERN = re.compile(r"layer_(\d+)$")
-
-
-def resolve_device(device_arg: str) -> torch.device:
-    """Resolve ``auto`` to CUDA when available, otherwise CPU."""
-    if device_arg == "auto":
-        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    return torch.device(device_arg)
-
-
-def discover_layers(cache_dir: Path, checkpoint_root: Path) -> list[int]:
-    """Return sorted layers that have both activations and an SAE checkpoint."""
-    cache_layers = {
-        int(match.group(1))
-        for path in cache_dir.glob("layer_*.safetensors")
-        if (match := LAYER_CACHE_PATTERN.fullmatch(path.name))
-    }
-    checkpoint_layers = {
-        int(match.group(1))
-        for path in checkpoint_root.glob("layer_*")
-        if path.is_dir() and (match := LAYER_DIR_PATTERN.fullmatch(path.name))
-        and (path / "sae_config.json").is_file()
-        and (path / "sae_weights.safetensors").is_file()
-    }
-
-    layers = sorted(cache_layers & checkpoint_layers)
-    if not layers:
-        raise FileNotFoundError(
-            "No matching layers were found. Expected activation files such as "
-            f"'{cache_dir / 'layer_0.safetensors'}' and SAE directories such as "
-            f"'{checkpoint_root / 'layer_0'}'."
-        )
-    return layers
-
-
-def load_training_sae(checkpoint_dir: Path, device: torch.device):
-    """Load a folded BatchTopK training checkpoint produced by train_sae.py."""
-    from sae_lens.saes.batchtopk_sae import (
-        BatchTopKTrainingSAE,
-        BatchTopKTrainingSAEConfig,
-    )
-
-    with open(checkpoint_dir / "sae_config.json", encoding="utf-8") as f:
-        saved_cfg = json.load(f)
-
-    sae_cfg = BatchTopKTrainingSAEConfig(
-        d_in=saved_cfg["d_in"],
-        d_sae=saved_cfg["d_sae"],
-        k=saved_cfg["k"],
-        aux_loss_coefficient=1.0,
-        rescale_acts_by_decoder_norm=True,
-        topk_threshold_lr=0.1,
-        apply_b_dec_to_input=False,
-        normalize_activations="expected_average_only_in",
-        decoder_init_norm=0.01,
-        device=str(device),
-        dtype="float32",
-    )
-    sae = BatchTopKTrainingSAE(sae_cfg).to(device)
-
-    weights = load_file(str(checkpoint_dir / "sae_weights.safetensors"))
-    sae.W_enc.data.copy_(weights["W_enc"].to(device))
-    sae.W_dec.data.copy_(weights["W_dec"].to(device))
-    sae.b_enc.data.copy_(weights["b_enc"].to(device))
-    sae.b_dec.data.copy_(weights["b_dec"].to(device))
-    sae.topk_threshold.data.copy_(weights["topk_threshold"].to(device))
-    sae.eval()
-    return sae, saved_cfg, "training"
-
-
-def load_inference_sae(checkpoint_dir: Path, device: torch.device):
-    """Load the JumpReLU inference checkpoint produced by train_sae.py."""
-    from sae_lens.saes.jumprelu_sae import JumpReLUSAE, JumpReLUSAEConfig
-
-    inference_dir = checkpoint_dir / "inference"
-    with open(inference_dir / "cfg.json", encoding="utf-8") as f:
-        inference_cfg = json.load(f)
-
-    sae_cfg = JumpReLUSAEConfig(
-        d_in=inference_cfg["d_in"],
-        d_sae=inference_cfg["d_sae"],
-        apply_b_dec_to_input=inference_cfg.get("apply_b_dec_to_input", False),
-        device=str(device),
-        dtype="float32",
-    )
-    sae = JumpReLUSAE(sae_cfg).to(device)
-
-    weights = load_file(str(inference_dir / "sae_weights.safetensors"))
-    sae.W_enc.data.copy_(weights["W_enc"].to(device))
-    sae.W_dec.data.copy_(weights["W_dec"].to(device))
-    sae.b_enc.data.copy_(weights["b_enc"].to(device))
-    sae.b_dec.data.copy_(weights["b_dec"].to(device))
-    sae.threshold.data.copy_(weights["threshold"].to(device))
-    sae.eval()
-    return sae, inference_cfg, "inference"
-
-
-def load_sae(
-    checkpoint_dir: Path, device: torch.device, sae_format: str
-):
-    """Load the requested SAE format, preferring JumpReLU for layer trends."""
-    inference_files_exist = (
-        (checkpoint_dir / "inference" / "cfg.json").is_file()
-        and (checkpoint_dir / "inference" / "sae_weights.safetensors").is_file()
-    )
-    if sae_format in {"auto", "inference"} and inference_files_exist:
-        return load_inference_sae(checkpoint_dir, device)
-    if sae_format == "inference":
-        raise FileNotFoundError(
-            f"Missing JumpReLU inference checkpoint under {checkpoint_dir / 'inference'}"
-        )
-    return load_training_sae(checkpoint_dir, device)
+from analysis.common import (  # noqa: E402
+    discover_layers,
+    linear_trend,
+    load_sae,
+    resolve_device,
+)
 
 
 @torch.inference_mode()
@@ -251,23 +147,6 @@ def compute_layer_statistics(
     if device.type == "cuda":
         torch.cuda.empty_cache()
     return result
-
-
-def linear_trend(x: np.ndarray, y: np.ndarray) -> tuple[float, float]:
-    """Return least-squares slope and Pearson correlation."""
-    if len(x) < 2:
-        return 0.0, 0.0
-    centered_x = x - x.mean()
-    centered_y = y - y.mean()
-    x_ss = float(np.dot(centered_x, centered_x))
-    y_ss = float(np.dot(centered_y, centered_y))
-    slope = float(np.dot(centered_x, centered_y) / x_ss) if x_ss else 0.0
-    correlation = (
-        float(np.dot(centered_x, centered_y) / np.sqrt(x_ss * y_ss))
-        if x_ss and y_ss
-        else 0.0
-    )
-    return slope, correlation
 
 
 def summarize_sparsity_trend(
@@ -398,7 +277,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--cache-dir",
         type=Path,
-        default=Path("data/activation_cache_dev"),
+        default=Path("data/activation_cache"),
         help="Directory containing layer_N.safetensors activation caches",
     )
     parser.add_argument(

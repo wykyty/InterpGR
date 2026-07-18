@@ -27,3 +27,5 @@ log/
 
 prompt.txt
 .env
+
+results/

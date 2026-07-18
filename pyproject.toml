@@ -17,6 +17,7 @@ dependencies = [
     "k-means-constrained>=0.7.3",
     "faiss-cpu>=1.11.0",
     "wandb>=0.27.0",
+    "matplotlib>=3.11.0",
 ]
 
 [[tool.uv.index]]

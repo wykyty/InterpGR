@@ -15,7 +15,14 @@ Usage:
 import argparse
 import json
 import os
+from collections import Counter
 from pathlib import Path
+
+# The server already has T5-large cached. Set offline mode before importing
+# Transformers/Hugging Face modules so they never attempt a network HEAD call.
+os.environ["HF_HUB_OFFLINE"] = "1"
+os.environ["TRANSFORMERS_OFFLINE"] = "1"
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 import torch
 from safetensors.torch import save_file, load_file
@@ -133,7 +140,15 @@ def collect_layers(
             acts = cache[f"decoder.{l}.hook_mlp_out"].squeeze(0).float().cpu()
             all_acts[l].append(acts)
 
-    return {l: torch.cat(acts, dim=0) for l, acts in all_acts.items()}
+    layer_data = {l: torch.cat(acts, dim=0) for l, acts in all_acts.items()}
+    expected_activations = sum(len(semantic_id) for semantic_id in semantic_ids)
+    for layer, activations in layer_data.items():
+        if activations.shape[0] != expected_activations:
+            raise RuntimeError(
+                f"Layer {layer}: collected {activations.shape[0]} activations, "
+                f"expected {expected_activations} (= sum of DocID lengths)"
+            )
+    return layer_data
 
 
 def main():
@@ -148,12 +163,13 @@ def main():
     parser.add_argument("--context_size", type=int, default=32)
     args = parser.parse_args()
 
-    os.environ["TOKENIZERS_PARALLELISM"] = "false"
-    os.environ.setdefault("HF_HUB_OFFLINE", "1")
-
     layers = args.layer if args.layer else list(range(N_LAYERS))
 
     queries, semantic_ids = load_data(args.data_path, args.semantic_id_path)
+    expected_activations = sum(len(semantic_id) for semantic_id in semantic_ids)
+    docid_length_distribution = dict(
+        sorted(Counter(len(semantic_id) for semantic_id in semantic_ids).items())
+    )
     cache_dir = Path(args.cache_dir)
     cache_dir.mkdir(parents=True, exist_ok=True)
 
@@ -161,6 +177,8 @@ def main():
     print(f"  Checkpoint:     {args.checkpoint}")
     print(f"  Semantic IDs:   {args.semantic_id_path}")
     print(f"  Cache dir:      {cache_dir}")
+    print(f"  Activations:    {expected_activations} (= sum of DocID lengths)")
+    print(f"  DocID lengths:  {docid_length_distribution}")
 
     if args.n_gpus > 1:
         import torch.multiprocessing as mp
@@ -176,11 +194,19 @@ def main():
     # Save per layer
     print("Saving...")
     for l in tqdm(layer_data.keys(), desc="Saving"):
+        if layer_data[l].shape != (expected_activations, 1024):
+            raise RuntimeError(
+                f"Layer {l}: refusing to save unexpected shape "
+                f"{tuple(layer_data[l].shape)}; expected "
+                f"({expected_activations}, 1024)"
+            )
         save_file({"activations": layer_data[l]}, str(cache_dir / f"layer_{l}.safetensors"))
         print(f"  Layer {l}: {layer_data[l].shape}")
 
     meta = {
         "n_queries": len(queries),
+        "n_activations": expected_activations,
+        "docid_length_distribution": docid_length_distribution,
         "layers": layers,
         "context_size": args.context_size,
         "checkpoint": args.checkpoint,
@@ -190,7 +216,7 @@ def main():
     with open(cache_dir / "metadata.json", "w") as f:
         json.dump(meta, f, indent=2)
 
-    print(f"\nDone! Cached {N_LAYERS} layers to {cache_dir}")
+    print(f"\nDone! Cached {len(layers)} layers to {cache_dir}")
     print(f"Now train with:")
     print(f"  python sae/train_sae.py --cache_dir {cache_dir} --layer 0")
 
